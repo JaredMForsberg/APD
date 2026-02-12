@@ -1,5 +1,7 @@
 // pill_ui.c  (NO KEYPAD VERSION)
 // GTK3 UI + schedules + time/date + wifi + dev edit + power shutdown
+// + Admin Reset (reset schedules + clear admin.txt)
+// + Admin Extract (copy admin log to selected USB drive)
 //
 // Compile:
 //   gcc -std=gnu99 /home/autopilldispense/Desktop/pill_ui.c -o /home/autopilldispense/Desktop/pill_ui $(pkg-config --cflags --libs gtk+-3.0)
@@ -12,9 +14,11 @@
 #include <time.h>
 #include <string.h>
 #include <ctype.h>
+#include <sys/stat.h>
 
 #define DEV_FILE_PATH "/home/autopilldispense/Desktop/pill_ui.c"
 #define SCHEDULE_FILE ".pill_dispenser_schedule.txt"
+#define ADMIN_LOG_PATH "/home/autopilldispense/Desktop/admin.txt"
 
 static const char *DAYS[7] = {"Mon","Tue","Wed","Thu","Fri","Sat","Sun"};
 
@@ -56,6 +60,13 @@ typedef struct {
     GtkWidget *wifi_pass_entry;
     char wifi_selected_ssid[256];
 
+    // Admin Extract page
+    GtkWidget *admin_status_label;
+    GtkListStore *usb_store;     // columns: 0=display, 1=mountpoint
+    GtkWidget *usb_tree;
+    GtkWidget *usb_selected_label;
+    char usb_selected_mount[512];
+
 } App;
 
 // ------------------- helpers -------------------
@@ -65,6 +76,18 @@ static void trim(char *s) {
     size_t i = 0;
     while (s[i] && isspace((unsigned char)s[i])) i++;
     if (i) memmove(s, s + i, strlen(s + i) + 1);
+}
+
+static void now_string(char *out, size_t outsz) {
+    time_t t = time(NULL);
+    struct tm *lt = localtime(&t);
+    strftime(out, outsz, "%Y-%m-%d %H:%M:%S", lt);
+}
+
+static void now_stamp(char *out, size_t outsz) {
+    time_t t = time(NULL);
+    struct tm *lt = localtime(&t);
+    strftime(out, outsz, "%Y%m%d_%H%M%S", lt);
 }
 
 static void set_label_to_now(GtkWidget *label) {
@@ -115,6 +138,10 @@ static GtkWidget *make_spin(int min, int max, int step) {
     GtkWidget *spin = gtk_spin_button_new(adj, 1, 0);
     gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(spin), TRUE);
     return spin;
+}
+
+static void ui_set_status(GtkWidget *label, const char *msg) {
+    gtk_label_set_text(GTK_LABEL(label), msg ? msg : "");
 }
 
 // ------------------- schedules persistence -------------------
@@ -190,6 +217,51 @@ static void update_main_schedule_labels(App *app) {
     }
 }
 
+// ------------------- admin logging -------------------
+static void admin_log_append_snapshot(App *app, const char *reason) {
+    FILE *f = fopen(ADMIN_LOG_PATH, "a");
+    if (!f) return;
+
+    char ts[64];
+    now_string(ts, sizeof(ts));
+
+    fprintf(f, "=== %s | %s ===\n", ts, reason ? reason : "Schedule update");
+    for (int i = 0; i < 7; i++) {
+        fprintf(f, "%s  Slot1 %02d:%02d  Slot2 %02d:%02d\n",
+                DAYS[i],
+                app->slot1[i].h, app->slot1[i].m,
+                app->slot2[i].h, app->slot2[i].m);
+    }
+    fprintf(f, "\n");
+    fclose(f);
+}
+
+static int admin_log_clear(void) {
+    FILE *f = fopen(ADMIN_LOG_PATH, "w");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+static int file_copy(const char *src, const char *dst) {
+    FILE *in = fopen(src, "rb");
+    if (!in) return 0;
+    FILE *out = fopen(dst, "wb");
+    if (!out) { fclose(in); return 0; }
+
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            fclose(in); fclose(out);
+            return 0;
+        }
+    }
+    fclose(in);
+    fclose(out);
+    return 1;
+}
+
 // ------------------- power + dev -------------------
 static void on_power_clicked(GtkWidget *w, gpointer user_data) {
     (void)w;
@@ -245,7 +317,9 @@ static void on_sched_save(GtkWidget *w, gpointer user_data) {
     App *app = (App *)user_data;
 
     pull_schedule_data_from_spins(app);
+
     if (save_schedules(app)) {
+        admin_log_append_snapshot(app, "Schedule saved");
         gtk_label_set_text(GTK_LABEL(app->sched_status_label), "Saved.");
         update_main_schedule_labels(app);
     } else {
@@ -308,10 +382,6 @@ static void show_time_date(App *app) {
 }
 
 // ------------------- wifi -------------------
-static void ui_set_status(GtkWidget *label, const char *msg) {
-    gtk_label_set_text(GTK_LABEL(label), msg ? msg : "");
-}
-
 static gboolean command_exists(const char *cmd) {
     char buf[256];
     snprintf(buf, sizeof(buf), "command -v %s >/dev/null 2>&1", cmd);
@@ -462,6 +532,159 @@ static void show_wifi(App *app) {
     wifi_scan_and_fill(app);
 }
 
+// ------------------- Admin: Reset & Extract -------------------
+static void on_admin_reset(GtkWidget *w, gpointer user_data) {
+    (void)w;
+    App *app = (App *)user_data;
+
+    GtkWidget *dlg = gtk_message_dialog_new(
+        GTK_WINDOW(app->window),
+        GTK_DIALOG_MODAL,
+        GTK_MESSAGE_WARNING,
+        GTK_BUTTONS_OK_CANCEL,
+        "Admin Reset?"
+    );
+    gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dlg),
+        "This will reset schedules back to default and erase all logs in admin.txt.");
+
+    int resp = gtk_dialog_run(GTK_DIALOG(dlg));
+    gtk_widget_destroy(dlg);
+    if (resp != GTK_RESPONSE_OK) return;
+
+    set_default_schedules(app);
+    save_schedules(app);
+    admin_log_clear();                 // wipe logs
+    admin_log_append_snapshot(app, "Admin reset (defaults applied)");
+
+    update_main_schedule_labels(app);
+    fill_schedule_spins_from_data(app);
+
+    ui_set_status(app->admin_status_label, "Reset complete: defaults applied + admin.txt cleared.");
+}
+
+static void usb_clear_store(App *app) {
+    gtk_list_store_clear(app->usb_store);
+    app->usb_selected_mount[0] = 0;
+    gtk_label_set_text(GTK_LABEL(app->usb_selected_label), "Selected: (none)");
+}
+
+static void usb_scan_mounted(App *app) {
+    usb_clear_store(app);
+
+    // We list mounted removable/USB drives via lsblk
+    // NAME LABEL MOUNTPOINT RM TRAN
+    FILE *fp = popen("lsblk -o NAME,LABEL,MOUNTPOINT,RM,TRAN -nr 2>/dev/null", "r");
+    if (!fp) {
+        ui_set_status(app->admin_status_label, "Failed to scan drives.");
+        return;
+    }
+
+    char line[1024];
+    int added = 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        trim(line);
+        if (!line[0]) continue;
+
+        // Parse: name label mount rm tran
+        // Note: LABEL can be empty, so we do a more forgiving parse by splitting from end.
+        // We'll token-split and then rebuild.
+        char name[64]={0}, label[128]={0}, mount[512]={0}, rm[8]={0}, tran[32]={0};
+
+        // easiest: read 5 tokens; if label is empty, lsblk still prints something, but can collapse.
+        // We'll use sscanf with wide fields; if it fails, skip.
+        if (sscanf(line, "%63s %127s %511s %7s %31s", name, label, mount, rm, tran) < 4) continue;
+
+        // If mountpoint is "-", treat as not mounted
+        if (strcmp(mount, "-") == 0) continue;
+
+        // Must be removable or usb transport
+        int is_rm = (strcmp(rm, "1") == 0);
+        int is_usb = (strcmp(tran, "usb") == 0);
+
+        if (!(is_rm || is_usb)) continue;
+
+        GtkTreeIter iter;
+        gtk_list_store_append(app->usb_store, &iter);
+
+        char display[900];
+        // If label looks like a mountpoint (due to weird tokenization), still show something useful
+        snprintf(display, sizeof(display), "%s  (%s)  →  %s", name, label, mount);
+
+        gtk_list_store_set(app->usb_store, &iter,
+                           0, display,
+                           1, mount,
+                           -1);
+        added++;
+    }
+
+    pclose(fp);
+
+    if (added == 0) ui_set_status(app->admin_status_label, "No mounted USB/removable drives found. Plug in + wait for it to mount.");
+    else ui_set_status(app->admin_status_label, "Select a destination drive, then press Export.");
+}
+
+static void on_usb_selection_changed(GtkTreeSelection *selection, gpointer user_data) {
+    App *app = (App *)user_data;
+
+    GtkTreeModel *model = NULL;
+    GtkTreeIter iter;
+    if (gtk_tree_selection_get_selected(selection, &model, &iter)) {
+        gchar *mount = NULL;
+        gtk_tree_model_get(model, &iter, 1, &mount, -1);
+        if (mount) {
+            strncpy(app->usb_selected_mount, mount, sizeof(app->usb_selected_mount) - 1);
+            app->usb_selected_mount[sizeof(app->usb_selected_mount) - 1] = 0;
+
+            char buf[700];
+            snprintf(buf, sizeof(buf), "Selected: %s", app->usb_selected_mount);
+            gtk_label_set_text(GTK_LABEL(app->usb_selected_label), buf);
+
+            g_free(mount);
+        }
+    }
+}
+
+static void on_admin_extract_rescan(GtkWidget *w, gpointer user_data) {
+    (void)w;
+    App *app = (App *)user_data;
+    usb_scan_mounted(app);
+}
+
+static void on_admin_extract_export(GtkWidget *w, gpointer user_data) {
+    (void)w;
+    App *app = (App *)user_data;
+
+    if (!app->usb_selected_mount[0]) {
+        ui_set_status(app->admin_status_label, "Pick a destination drive first.");
+        return;
+    }
+
+    // Ensure admin.txt exists (create if missing)
+    FILE *f = fopen(ADMIN_LOG_PATH, "a");
+    if (f) fclose(f);
+
+    char stamp[64];
+    now_stamp(stamp, sizeof(stamp));
+
+    char outpath[1024];
+    snprintf(outpath, sizeof(outpath), "%s/pill_admin_export_%s.txt", app->usb_selected_mount, stamp);
+
+    if (file_copy(ADMIN_LOG_PATH, outpath)) {
+        char msg[1200];
+        snprintf(msg, sizeof(msg), "Exported to: %s", outpath);
+        ui_set_status(app->admin_status_label, msg);
+    } else {
+        ui_set_status(app->admin_status_label, "Export failed. Drive may be read-only or not mounted.");
+    }
+}
+
+static void show_admin_extract(App *app) {
+    ui_set_status(app->admin_status_label, "");
+    usb_scan_mounted(app);
+    show_page(app, "admin_extract");
+}
+
 // ------------------- page builders -------------------
 static GtkWidget *build_main_page(App *app) {
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
@@ -477,7 +700,6 @@ static GtkWidget *build_main_page(App *app) {
 
     GtkWidget *btn_settings = make_top_icon_button("emblem-system");
     GtkWidget *btn_power = make_top_icon_button("system-shutdown");
-
     g_signal_connect_swapped(btn_settings, "clicked", G_CALLBACK(show_settings), app);
     g_signal_connect(btn_power, "clicked", G_CALLBACK(on_power_clicked), app);
 
@@ -485,6 +707,7 @@ static GtkWidget *build_main_page(App *app) {
     gtk_box_pack_start(GTK_BOX(top), spacer, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(top), btn_settings, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(top), btn_power, FALSE, FALSE, 0);
+
     gtk_box_pack_start(GTK_BOX(root), top, FALSE, FALSE, 0);
 
     app->time_label_main = gtk_label_new("");
@@ -541,11 +764,12 @@ static GtkWidget *build_settings_page(App *app) {
     gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
     gtk_box_pack_start(GTK_BOX(root), grid, TRUE, TRUE, 0);
 
-    const char *ids[4]    = {"schedules","time_date","wifi","dev"};
-    const char *labels[4] = {"Schedules","Time & Date","Wi-Fi Config","Dev: Edit Code"};
-    const char *icons[4]  = {"x-office-calendar","preferences-system-time","network-wireless","accessories-text-editor"};
+    // 6 icons now
+    const char *ids[6]    = {"schedules","time_date","wifi","dev","admin_extract","admin_reset"};
+    const char *labels[6] = {"Schedules","Time & Date","Wi-Fi Config","Dev: Edit Code","Admin Extract","Admin Reset"};
+    const char *icons[6]  = {"x-office-calendar","preferences-system-time","network-wireless","accessories-text-editor","document-send","edit-clear"};
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 6; i++) {
         GtkWidget *btn = gtk_button_new();
         GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
         GtkWidget *img = gtk_image_new_from_icon_name(icons[i], GTK_ICON_SIZE_DIALOG);
@@ -562,6 +786,8 @@ static GtkWidget *build_settings_page(App *app) {
         else if (strcmp(ids[i], "time_date") == 0) g_signal_connect_swapped(btn, "clicked", G_CALLBACK(show_time_date), app);
         else if (strcmp(ids[i], "wifi") == 0) g_signal_connect_swapped(btn, "clicked", G_CALLBACK(show_wifi), app);
         else if (strcmp(ids[i], "dev") == 0) g_signal_connect(btn, "clicked", G_CALLBACK(on_dev_edit_clicked), app);
+        else if (strcmp(ids[i], "admin_extract") == 0) g_signal_connect_swapped(btn, "clicked", G_CALLBACK(show_admin_extract), app);
+        else if (strcmp(ids[i], "admin_reset") == 0) g_signal_connect(btn, "clicked", G_CALLBACK(on_admin_reset), app);
 
         gtk_grid_attach(GTK_GRID(grid), btn, i % 2, i / 2, 1, 1);
     }
@@ -762,11 +988,65 @@ static GtkWidget *build_wifi_page(App *app) {
     return root;
 }
 
+static GtkWidget *build_admin_extract_page(App *app) {
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+
+    GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    GtkWidget *back = gtk_button_new_with_label("← Back");
+    g_signal_connect_swapped(back, "clicked", G_CALLBACK(show_settings), app);
+
+    GtkWidget *hdr = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(hdr), "<span size='x-large' weight='bold'>Admin Extract</span>");
+    gtk_label_set_xalign(GTK_LABEL(hdr), 0.0f);
+
+    GtkWidget *rescan = gtk_button_new_with_label("Rescan Drives");
+    g_signal_connect(rescan, "clicked", G_CALLBACK(on_admin_extract_rescan), app);
+
+    gtk_box_pack_start(GTK_BOX(top), back, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(top), hdr, TRUE, TRUE, 0);
+    gtk_box_pack_end(GTK_BOX(top), rescan, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(root), top, FALSE, FALSE, 0);
+
+    // USB list
+    app->usb_store = gtk_list_store_new(2, G_TYPE_STRING, G_TYPE_STRING);
+    app->usb_tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(app->usb_store));
+    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(app->usb_tree), TRUE);
+
+    GtkCellRenderer *r = gtk_cell_renderer_text_new();
+    GtkTreeViewColumn *col = gtk_tree_view_column_new_with_attributes("Mounted USB / Removable Drives", r, "text", 0, NULL);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(app->usb_tree), col);
+
+    GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(app->usb_tree));
+    gtk_tree_selection_set_mode(sel, GTK_SELECTION_SINGLE);
+    g_signal_connect(sel, "changed", G_CALLBACK(on_usb_selection_changed), app);
+
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_container_add(GTK_CONTAINER(scroll), app->usb_tree);
+    gtk_widget_set_vexpand(scroll, TRUE);
+    gtk_box_pack_start(GTK_BOX(root), scroll, TRUE, TRUE, 0);
+
+    app->usb_selected_label = gtk_label_new("Selected: (none)");
+    gtk_label_set_xalign(GTK_LABEL(app->usb_selected_label), 0.0f);
+    gtk_box_pack_start(GTK_BOX(root), app->usb_selected_label, FALSE, FALSE, 0);
+
+    GtkWidget *btn_export = gtk_button_new_with_label("Export admin.txt to selected drive");
+    g_signal_connect(btn_export, "clicked", G_CALLBACK(on_admin_extract_export), app);
+    gtk_box_pack_start(GTK_BOX(root), btn_export, FALSE, FALSE, 0);
+
+    app->admin_status_label = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(app->admin_status_label), 0.0f);
+    gtk_box_pack_start(GTK_BOX(root), app->admin_status_label, FALSE, FALSE, 0);
+
+    return root;
+}
+
 // ------------------- MAIN -------------------
 int main(int argc, char **argv) {
     App app;
     memset(&app, 0, sizeof(app));
     app.wifi_selected_ssid[0] = 0;
+    app.usb_selected_mount[0] = 0;
 
     gtk_init(&argc, &argv);
 
@@ -789,6 +1069,7 @@ int main(int argc, char **argv) {
     gtk_stack_add_named(GTK_STACK(app.stack), build_schedules_page(&app), "schedules");
     gtk_stack_add_named(GTK_STACK(app.stack), build_time_date_page(&app), "time_date");
     gtk_stack_add_named(GTK_STACK(app.stack), build_wifi_page(&app), "wifi");
+    gtk_stack_add_named(GTK_STACK(app.stack), build_admin_extract_page(&app), "admin_extract");
 
     show_main(&app);
     update_main_schedule_labels(&app);
