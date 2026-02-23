@@ -15,12 +15,20 @@
 #include <string.h>
 #include <ctype.h>
 #include <sys/stat.h>
+#include <gpiod.h> //For GPIO activation
+#include <stdio.h> 
 
 #define DEV_FILE_PATH "/home/autopilldispense/Desktop/pill_ui.c"
 #define SCHEDULE_FILE ".pill_dispenser_schedule.txt"
 #define ADMIN_LOG_PATH "/home/autopilldispense/Desktop/admin.txt"
 
 static const char *DAYS[7] = {"Mon","Tue","Wed","Thu","Fri","Sat","Sun"};
+
+static int motor_pins[16] = {17, 27, 22, 5, 6, 13, 19, 26, 18, 23, 24, 25, 12, 16, 20, 21};
+struct gpiod_line *motor_lines[16];
+static int reserved_pins [8] = {2, 3, 14, 15, 7, 8, 9, 10}; //for future use with keypad, could swap for 11 for one of these and maybe 4 
+
+struct gpiod_chip *chip;
 
 typedef struct { int h; int m; } HM;
 
@@ -69,6 +77,8 @@ typedef struct {
 
 } App;
 
+void dispense (int);
+
 // ------------------- helpers -------------------
 static void trim(char *s) {
     size_t len = strlen(s);
@@ -103,6 +113,37 @@ static gboolean tick_update_time(gpointer user_data) {
     if (app->time_label_main) set_label_to_now(app->time_label_main);
     if (app->time_label_timepage) set_label_to_now(app->time_label_timepage);
     if (app->wifi_time_label) set_label_to_now(app->wifi_time_label);
+    
+    //#TODO: will need a way to make it not occur 60 times in a row. probably a way to just check the day first and then go to that slot?
+    static int last_dispense_minute = -1;
+    
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now); //gets current time
+    
+    if (t->tm_min == last_dispense_minute) {
+        return TRUE; //return early if already checked this minute
+    } else {
+        last_dispense_minute = t->tm_min; //otherwise set the variable so that next time we wont check for a dispense
+    }
+     //does conversion so that monday is first day of the week, can be removed if we put sunday as first in the UI
+    t->tm_wday = t->tm_wday+1;
+    if (t->tm_wday == 7) {
+        t->tm_wday = 0;
+    }
+    
+    //Checks the day hour and time for dispense, first for slot 1 , then slot 2, will need to update once we do more than one pill per dispense.
+    for (int i = 0; i<7; i++) {
+        if (t->tm_wday == i && t->tm_hour == app->slot1[i].h && t->tm_min == app->slot1[i].m) {
+        dispense(1);
+        }
+    }
+    
+    for (int i = 0; i<7; i++) {
+        if (t->tm_wday == i && t->tm_hour == app->slot2[i].h && t->tm_min == app->slot2[i].m) {
+        dispense(2);
+        }
+    }
+    
     return TRUE;
 }
 
@@ -512,7 +553,7 @@ static void on_wifi_connect(GtkWidget *widget, gpointer user_data) {
         snprintf(cmd, sizeof(cmd),
                  "pkexec nmcli dev wifi connect \"%s\"",
                  app->wifi_selected_ssid);
-    }
+                     }
 
     ui_set_status(app->wifi_status_label, "Connecting... (auth prompt may appear)");
     int rc = system(cmd);
@@ -1041,6 +1082,97 @@ static GtkWidget *build_admin_extract_page(App *app) {
     return root;
 }
 
+// ------------Dispenser Helper ---------------
+//dispense logic, checks the slot, then actuates pull back, push out, pull back, push out sequentially
+//could remove redundency but this allows for confirmation other pins are off
+void dispense (int slot) {
+    if (slot == 1) {
+        gpiod_line_set_value(motor_lines[4], 0);
+        gpiod_line_set_value(motor_lines[5], 0);
+        gpiod_line_set_value(motor_lines[6], 1);
+        gpiod_line_set_value(motor_lines[7], 1);
+        
+        usleep(1000000);//change to match delay needed for motor
+        
+        gpiod_line_set_value(motor_lines[6], 0);
+        gpiod_line_set_value(motor_lines[7], 0);
+        
+        gpiod_line_set_value(motor_lines[3], 0);
+        gpiod_line_set_value(motor_lines[2], 0);
+        gpiod_line_set_value(motor_lines[0], 1);
+        gpiod_line_set_value(motor_lines[1], 1);
+        
+        usleep(1000000);
+        
+        gpiod_line_set_value(motor_lines[0], 0);
+        gpiod_line_set_value(motor_lines[1], 0);
+        
+        gpiod_line_set_value(motor_lines[3], 1);
+        gpiod_line_set_value(motor_lines[2], 1);
+        gpiod_line_set_value(motor_lines[0], 0);
+        gpiod_line_set_value(motor_lines[1], 0);
+        
+        usleep(1000000);
+        
+        gpiod_line_set_value(motor_lines[3], 0);
+        gpiod_line_set_value(motor_lines[2], 0);
+        
+        gpiod_line_set_value(motor_lines[4], 1);
+        gpiod_line_set_value(motor_lines[5], 1);
+        gpiod_line_set_value(motor_lines[6], 0);
+        gpiod_line_set_value(motor_lines[7], 0);
+        
+        usleep(1000000);
+        
+        gpiod_line_set_value(motor_lines[4], 0);
+        gpiod_line_set_value(motor_lines[5], 0);
+        
+    }else if (slot == 2) {
+        
+        gpiod_line_set_value(motor_lines[12], 0);
+        gpiod_line_set_value(motor_lines[13], 0);
+        gpiod_line_set_value(motor_lines[14], 1);
+        gpiod_line_set_value(motor_lines[15], 1);
+        
+        usleep(1000000);//change to match delay needed for motor
+        
+        gpiod_line_set_value(motor_lines[14], 0);
+        gpiod_line_set_value(motor_lines[15], 0);
+        
+        gpiod_line_set_value(motor_lines[11], 0);
+        gpiod_line_set_value(motor_lines[10], 0);
+        gpiod_line_set_value(motor_lines[8], 1);
+        gpiod_line_set_value(motor_lines[9], 1);
+        
+        usleep(1000000);
+        
+        gpiod_line_set_value(motor_lines[8], 0);
+        gpiod_line_set_value(motor_lines[9], 0);
+        
+        gpiod_line_set_value(motor_lines[11], 1);
+        gpiod_line_set_value(motor_lines[10], 1);
+        gpiod_line_set_value(motor_lines[8], 0);
+        gpiod_line_set_value(motor_lines[9], 0);
+        
+        usleep(1000000);
+        
+        gpiod_line_set_value(motor_lines[11], 0);
+        gpiod_line_set_value(motor_lines[10], 0);
+        
+        gpiod_line_set_value(motor_lines[12], 1);
+        gpiod_line_set_value(motor_lines[13], 1);
+        gpiod_line_set_value(motor_lines[14], 0);
+        gpiod_line_set_value(motor_lines[15], 0);        
+        
+        usleep(1000000);
+        
+        gpiod_line_set_value(motor_lines[12], 0);
+        gpiod_line_set_value(motor_lines[13], 0);
+        
+    }
+
+}
+
 // ------------------- MAIN -------------------
 int main(int argc, char **argv) {
     App app;
@@ -1073,6 +1205,17 @@ int main(int argc, char **argv) {
 
     show_main(&app);
     update_main_schedule_labels(&app);
+
+    chip = gpiod_chip_open("/dev/gpiochip0");
+    if(!chip) {
+        return 1; //failure to open GPIO chip, cannot continue
+    }
+    for (int i = 0; i<16; i++) {
+        motor_lines[i] = gpiod_chip_get_line(chip, motor_pins[i]);
+        gpiod_line_request_output(motor_lines[i], "Pill-Dispenser", 0);
+        }
+
+    //dispense(1); //Adding for a test, delete this
 
     g_timeout_add(1000, tick_update_time, &app);
     tick_update_time(&app);
