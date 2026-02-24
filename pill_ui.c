@@ -126,22 +126,14 @@ static gboolean tick_update_time(gpointer user_data) {
         last_dispense_minute = t->tm_min; //otherwise set the variable so that next time we wont check for a dispense
     }
      //does conversion so that monday is first day of the week, can be removed if we put sunday as first in the UI
-    t->tm_wday = t->tm_wday+1;
-    if (t->tm_wday == 7) {
-        t->tm_wday = 0;
-    }
-    
+     int today = (t->tm_wday +6) % 7;
     //Checks the day hour and time for dispense, first for slot 1 , then slot 2, will need to update once we do more than one pill per dispense.
-    for (int i = 0; i<7; i++) {
-        if (t->tm_wday == i && t->tm_hour == app->slot1[i].h && t->tm_min == app->slot1[i].m) {
+    if (t->tm_hour == app->slot1[today].h && t->tm_min == app->slot1[today].m) {
         dispense(1);
-        }
     }
     
-    for (int i = 0; i<7; i++) {
-        if (t->tm_wday == i && t->tm_hour == app->slot2[i].h && t->tm_min == app->slot2[i].m) {
+    if (t->tm_hour == app->slot2[today].h && t->tm_min == app->slot2[today].m) {
         dispense(2);
-        }
     }
     
     return TRUE;
@@ -1215,7 +1207,7 @@ int main(int argc, char **argv) {
         gpiod_line_request_output(motor_lines[i], "Pill-Dispenser", 0);
         }
 
-    //dispense(1); //Adding for a test, delete this
+    dispense(1); //Adding for a test, delete this
 
     g_timeout_add(1000, tick_update_time, &app);
     tick_update_time(&app);
