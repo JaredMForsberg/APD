@@ -1,35 +1,36 @@
-// pill_ui.c  (NO KEYPAD VERSION)
+// pill_ui.c  (NO KEYPAD VERSION)  — NO libgpiod (uses raspi-gpio)
 // GTK3 UI + schedules + time/date + wifi + dev edit + power shutdown
 // + Admin Reset (reset schedules + clear admin.txt)
 // + Admin Extract (copy admin log to selected USB drive)
+// + Admin Extract is gated by Pi user's password via pkexec (no separate admin password)
+//
+// NOTE: Motor GPIO control uses the built-in `raspi-gpio` command.
+// That means you DO NOT need libgpiod, and you should NOT compile with -lgpiod.
 //
 // Compile:
-//   gcc -std=gnu99 /home/autopilldispense/Desktop/pill_ui.c -o /home/autopilldispense/Desktop/pill_ui $(pkg-config --cflags --libs gtk+-3.0) -lgpiod
+//   gcc -std=gnu99 -O2 -Wall -Wextra /home/autopilldispense/Desktop/pill_ui.c -o /home/autopilldispense/Desktop/pill_ui $(pkg-config --cflags --libs gtk+-3.0)
 //
 // Run:
 //   /home/autopilldispense/Desktop/pill_ui
 
+#define _GNU_SOURCE
 #include <gtk/gtk.h>
 #include <stdlib.h>
 #include <time.h>
 #include <string.h>
 #include <ctype.h>
 #include <sys/stat.h>
-#include <gpiod.h>
 #include <stdio.h>
 #include <unistd.h>
 
-#define DEV_FILE_PATH "/home/autopilldispense/Desktop/pill_ui.c"
-#define SCHEDULE_FILE ".pill_dispenser_schedule.txt"
-#define ADMIN_LOG_PATH "/home/autopilldispense/Desktop/admin.txt"
+#define DEV_FILE_PATH   "/home/autopilldispense/Desktop/pill_ui.c"
+#define SCHEDULE_FILE   ".pill_dispenser_schedule.txt"
+#define ADMIN_LOG_PATH  "/home/autopilldispense/Desktop/admin.txt"
 
 static const char *DAYS[7] = {"Mon","Tue","Wed","Thu","Fri","Sat","Sun"};
 
+// Your original motor pins array (kept same)
 static int motor_pins[16] = {17, 27, 22, 5, 6, 13, 19, 26, 18, 23, 24, 25, 12, 16, 20, 21};
-struct gpiod_line *motor_lines[16];
-static int reserved_pins [8] = {2, 3, 14, 15, 7, 8, 9, 10};
-
-struct gpiod_chip *chip;
 
 typedef struct { int h; int m; } HM;
 
@@ -78,10 +79,9 @@ typedef struct {
 
 } App;
 
-void dispense(int slot);
-
 // ------------------- helpers -------------------
 static void trim(char *s) {
+    if (!s) return;
     size_t len = strlen(s);
     while (len && isspace((unsigned char)s[len - 1])) s[--len] = 0;
     size_t i = 0;
@@ -109,10 +109,14 @@ static void set_label_to_now(GtkWidget *label) {
     gtk_label_set_text(GTK_LABEL(label), buf);
 }
 
+static void ui_set_status(GtkWidget *label, const char *msg) {
+    gtk_label_set_text(GTK_LABEL(label), msg ? msg : "");
+}
+
 static void show_page(App *app, const char *name) {
     gtk_stack_set_visible_child_name(GTK_STACK(app->stack), name);
 }
-static void show_main(App *app) { show_page(app, "main"); }
+static void show_main(App *app)     { show_page(app, "main"); }
 static void show_settings(App *app) { show_page(app, "settings"); }
 
 // ------------------- UI helpers -------------------
@@ -141,10 +145,6 @@ static GtkWidget *make_spin(int min, int max, int step) {
     GtkWidget *spin = gtk_spin_button_new(adj, 1, 0);
     gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(spin), TRUE);
     return spin;
-}
-
-static void ui_set_status(GtkWidget *label, const char *msg) {
-    gtk_label_set_text(GTK_LABEL(label), msg ? msg : "");
 }
 
 // ------------------- schedules persistence -------------------
@@ -282,6 +282,16 @@ static int file_copy(const char *src, const char *dst) {
     fclose(in);
     fclose(out);
     return 1;
+}
+
+// ------------------- pkexec auth helper (uses Pi user password prompt) -------------------
+static int pkexec_auth_ping(void) {
+    // This triggers polkit auth prompt if needed; returns 0 if authorized.
+    // We do NOT create a new password; it uses the system user's password.
+    int rc = system("pkexec /usr/bin/true >/dev/null 2>&1");
+    if (rc == -1) return -1;
+    // system() returns shell-style status; treat 0 as OK.
+    return (rc == 0) ? 0 : 1;
 }
 
 // ------------------- power + dev -------------------
@@ -607,12 +617,15 @@ static void usb_scan_mounted(App *app) {
         if (!line[0]) continue;
 
         char name[64]={0}, label[128]={0}, mount[512]={0}, rm[8]={0}, tran[32]={0};
-        if (sscanf(line, "%63s %127s %511s %7s %31s", name, label, mount, rm, tran) < 4) continue;
+        // Some lsblk lines can have empty LABEL; parse safely:
+        // We’ll try: NAME LABEL MOUNTPOINT RM TRAN
+        int n = sscanf(line, "%63s %127s %511s %7s %31s", name, label, mount, rm, tran);
+        if (n < 4) continue;
 
         if (strcmp(mount, "-") == 0) continue;
 
         int is_rm = (strcmp(rm, "1") == 0);
-        int is_usb = (strcmp(tran, "usb") == 0);
+        int is_usb = (n >= 5 && strcmp(tran, "usb") == 0);
 
         if (!(is_rm || is_usb)) continue;
 
@@ -658,8 +671,7 @@ static void on_usb_selection_changed(GtkTreeSelection *selection, gpointer user_
 
 static void on_admin_extract_rescan(GtkWidget *w, gpointer user_data) {
     (void)w;
-    App *app = (App *)user_data;
-    usb_scan_mounted(app);
+    usb_scan_mounted((App *)user_data);
 }
 
 static void on_admin_extract_export(GtkWidget *w, gpointer user_data) {
@@ -671,6 +683,14 @@ static void on_admin_extract_export(GtkWidget *w, gpointer user_data) {
         return;
     }
 
+    // Require Pi user's password (polkit) before exporting
+    int auth = pkexec_auth_ping();
+    if (auth != 0) {
+        ui_set_status(app->admin_status_label, "Export cancelled (auth required).");
+        return;
+    }
+
+    // Make sure file exists
     FILE *f = fopen(ADMIN_LOG_PATH, "a");
     if (f) fclose(f);
 
@@ -680,7 +700,20 @@ static void on_admin_extract_export(GtkWidget *w, gpointer user_data) {
     char outpath[1024];
     snprintf(outpath, sizeof(outpath), "%s/pill_admin_export_%s.txt", app->usb_selected_mount, stamp);
 
-    if (file_copy(ADMIN_LOG_PATH, outpath)) {
+    // Use pkexec to copy (ensures permission prompt uses Pi user password)
+    // NOTE: To avoid tricky shell escaping, we disallow quotes in mountpoint.
+    if (strchr(outpath, '"') || strchr(ADMIN_LOG_PATH, '"')) {
+        ui_set_status(app->admin_status_label, "Export failed: invalid path (quotes not allowed).");
+        return;
+    }
+
+    char cmd[1400];
+    snprintf(cmd, sizeof(cmd),
+             "pkexec /bin/sh -c \"cp '%s' '%s'\"",
+             ADMIN_LOG_PATH, outpath);
+
+    int rc = system(cmd);
+    if (rc == 0) {
         char msg[1200];
         snprintf(msg, sizeof(msg), "Exported to: %s", outpath);
         ui_set_status(app->admin_status_label, msg);
@@ -690,9 +723,152 @@ static void on_admin_extract_export(GtkWidget *w, gpointer user_data) {
 }
 
 static void show_admin_extract(App *app) {
+    // Require auth just to open this page (like “admin password prompt” but using Pi user password)
+    int auth = pkexec_auth_ping();
+    if (auth != 0) {
+        // If they cancel auth, just stay in settings.
+        return;
+    }
+
     ui_set_status(app->admin_status_label, "");
     usb_scan_mounted(app);
     show_page(app, "admin_extract");
+}
+
+// ------------------- GPIO via raspi-gpio -------------------
+static void gpio_setup_outputs(void) {
+    // Set each motor pin to output and default low
+    for (int i = 0; i < 16; i++) {
+        char cmd[128];
+        // op = output, dl = drive low
+        snprintf(cmd, sizeof(cmd), "raspi-gpio set %d op dl", motor_pins[i]);
+        system(cmd);
+    }
+}
+
+static void gpio_write(int pin, int value) {
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "raspi-gpio set %d %s", pin, value ? "dh" : "dl");
+    system(cmd);
+}
+
+// ------------ Dispenser Helper ---------------
+// This keeps your SAME pattern, just swaps gpiod_line_set_value -> raspi-gpio writes.
+static void dispense(int slot) {
+    if (slot == 1) {
+        // motor_lines[4..7] -> motor_pins[4..7]
+        gpio_write(motor_pins[4], 0);
+        gpio_write(motor_pins[5], 0);
+        gpio_write(motor_pins[6], 1);
+        gpio_write(motor_pins[7], 1);
+        usleep(1000000);
+
+        gpio_write(motor_pins[6], 0);
+        gpio_write(motor_pins[7], 0);
+
+        gpio_write(motor_pins[3], 0);
+        gpio_write(motor_pins[2], 0);
+        gpio_write(motor_pins[0], 1);
+        gpio_write(motor_pins[1], 1);
+        usleep(1000000);
+
+        gpio_write(motor_pins[0], 0);
+        gpio_write(motor_pins[1], 0);
+
+        gpio_write(motor_pins[3], 1);
+        gpio_write(motor_pins[2], 1);
+        gpio_write(motor_pins[0], 0);
+        gpio_write(motor_pins[1], 0);
+        usleep(1000000);
+
+        gpio_write(motor_pins[3], 0);
+        gpio_write(motor_pins[2], 0);
+
+        gpio_write(motor_pins[4], 1);
+        gpio_write(motor_pins[5], 1);
+        gpio_write(motor_pins[6], 0);
+        gpio_write(motor_pins[7], 0);
+        usleep(1000000);
+
+        gpio_write(motor_pins[4], 0);
+        gpio_write(motor_pins[5], 0);
+
+    } else if (slot == 2) {
+        gpio_write(motor_pins[12], 0);
+        gpio_write(motor_pins[13], 0);
+        gpio_write(motor_pins[14], 1);
+        gpio_write(motor_pins[15], 1);
+        usleep(1000000);
+
+        gpio_write(motor_pins[14], 0);
+        gpio_write(motor_pins[15], 0);
+
+        gpio_write(motor_pins[11], 0);
+        gpio_write(motor_pins[10], 0);
+        gpio_write(motor_pins[8], 1);
+        gpio_write(motor_pins[9], 1);
+        usleep(1000000);
+
+        gpio_write(motor_pins[8], 0);
+        gpio_write(motor_pins[9], 0);
+
+        gpio_write(motor_pins[11], 1);
+        gpio_write(motor_pins[10], 1);
+        gpio_write(motor_pins[8], 0);
+        gpio_write(motor_pins[9], 0);
+        usleep(1000000);
+
+        gpio_write(motor_pins[11], 0);
+        gpio_write(motor_pins[10], 0);
+
+        gpio_write(motor_pins[12], 1);
+        gpio_write(motor_pins[13], 1);
+        gpio_write(motor_pins[14], 0);
+        gpio_write(motor_pins[15], 0);
+        usleep(1000000);
+
+        gpio_write(motor_pins[12], 0);
+        gpio_write(motor_pins[13], 0);
+    }
+}
+
+// ------------------- timer tick (time + auto reload + dispense checks) -------------------
+static gboolean tick_update_time(gpointer user_data) {
+    App *app = (App *)user_data;
+
+    if (app->time_label_main)     set_label_to_now(app->time_label_main);
+    if (app->time_label_timepage) set_label_to_now(app->time_label_timepage);
+    if (app->wifi_time_label)     set_label_to_now(app->wifi_time_label);
+
+    // Auto-reload schedule file if changed (e.g., edited via M5 web)
+    static time_t last_mtime = 0;
+    if (schedule_file_changed(&last_mtime)) {
+        load_schedules(app);
+        update_main_schedule_labels(app);
+        fill_schedule_spins_from_data(app);
+    }
+
+    // Dispense check: only once per minute
+    static int last_dispense_minute = -1;
+
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    if (!t) return TRUE;
+
+    if (t->tm_min == last_dispense_minute) return TRUE;
+    last_dispense_minute = t->tm_min;
+
+    // Linux tm_wday: Sun=0..Sat=6. Convert to Mon=0..Sun=6:
+    int today = (t->tm_wday + 6) % 7;
+
+    if (t->tm_hour == app->slot1[today].h && t->tm_min == app->slot1[today].m) {
+        dispense(1);
+    }
+    if (t->tm_hour == app->slot2[today].h && t->tm_min == app->slot2[today].m) {
+        dispense(2);
+    }
+
+    return TRUE;
 }
 
 // ------------------- page builders -------------------
@@ -774,7 +950,6 @@ static GtkWidget *build_settings_page(App *app) {
     gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
     gtk_box_pack_start(GTK_BOX(root), grid, TRUE, TRUE, 0);
 
-    const char *ids[6]    = {"schedules","time_date","wifi","dev","admin_extract","admin_reset"};
     const char *labels[6] = {"Schedules","Time & Date","Wi-Fi Config","Dev: Edit Code","Admin Extract","Admin Reset"};
     const char *icons[6]  = {"x-office-calendar","preferences-system-time","network-wireless","accessories-text-editor","document-send","edit-clear"};
 
@@ -791,12 +966,12 @@ static GtkWidget *build_settings_page(App *app) {
         gtk_box_pack_start(GTK_BOX(box), lbl, FALSE, FALSE, 0);
         gtk_container_add(GTK_CONTAINER(btn), box);
 
-        if (strcmp(ids[i], "schedules") == 0) g_signal_connect_swapped(btn, "clicked", G_CALLBACK(show_schedules), app);
-        else if (strcmp(ids[i], "time_date") == 0) g_signal_connect_swapped(btn, "clicked", G_CALLBACK(show_time_date), app);
-        else if (strcmp(ids[i], "wifi") == 0) g_signal_connect_swapped(btn, "clicked", G_CALLBACK(show_wifi), app);
-        else if (strcmp(ids[i], "dev") == 0) g_signal_connect(btn, "clicked", G_CALLBACK(on_dev_edit_clicked), app);
-        else if (strcmp(ids[i], "admin_extract") == 0) g_signal_connect_swapped(btn, "clicked", G_CALLBACK(show_admin_extract), app);
-        else if (strcmp(ids[i], "admin_reset") == 0) g_signal_connect(btn, "clicked", G_CALLBACK(on_admin_reset), app);
+        if (i == 0) g_signal_connect_swapped(btn, "clicked", G_CALLBACK(show_schedules), app);
+        if (i == 1) g_signal_connect_swapped(btn, "clicked", G_CALLBACK(show_time_date), app);
+        if (i == 2) g_signal_connect_swapped(btn, "clicked", G_CALLBACK(show_wifi), app);
+        if (i == 3) g_signal_connect(btn, "clicked", G_CALLBACK(on_dev_edit_clicked), app);
+        if (i == 4) g_signal_connect_swapped(btn, "clicked", G_CALLBACK(show_admin_extract), app);
+        if (i == 5) g_signal_connect(btn, "clicked", G_CALLBACK(on_admin_reset), app);
 
         gtk_grid_attach(GTK_GRID(grid), btn, i % 2, i / 2, 1, 1);
     }
@@ -1049,133 +1224,6 @@ static GtkWidget *build_admin_extract_page(App *app) {
     return root;
 }
 
-// ------------ Dispenser Helper ---------------
-void dispense(int slot) {
-    if (slot == 1) {
-        gpiod_line_set_value(motor_lines[4], 0);
-        gpiod_line_set_value(motor_lines[5], 0);
-        gpiod_line_set_value(motor_lines[6], 1);
-        gpiod_line_set_value(motor_lines[7], 1);
-
-        usleep(1000000);
-
-        gpiod_line_set_value(motor_lines[6], 0);
-        gpiod_line_set_value(motor_lines[7], 0);
-
-        gpiod_line_set_value(motor_lines[3], 0);
-        gpiod_line_set_value(motor_lines[2], 0);
-        gpiod_line_set_value(motor_lines[0], 1);
-        gpiod_line_set_value(motor_lines[1], 1);
-
-        usleep(1000000);
-
-        gpiod_line_set_value(motor_lines[0], 0);
-        gpiod_line_set_value(motor_lines[1], 0);
-
-        gpiod_line_set_value(motor_lines[3], 1);
-        gpiod_line_set_value(motor_lines[2], 1);
-        gpiod_line_set_value(motor_lines[0], 0);
-        gpiod_line_set_value(motor_lines[1], 0);
-
-        usleep(1000000);
-
-        gpiod_line_set_value(motor_lines[3], 0);
-        gpiod_line_set_value(motor_lines[2], 0);
-
-        gpiod_line_set_value(motor_lines[4], 1);
-        gpiod_line_set_value(motor_lines[5], 1);
-        gpiod_line_set_value(motor_lines[6], 0);
-        gpiod_line_set_value(motor_lines[7], 0);
-
-        usleep(1000000);
-
-        gpiod_line_set_value(motor_lines[4], 0);
-        gpiod_line_set_value(motor_lines[5], 0);
-
-    } else if (slot == 2) {
-        gpiod_line_set_value(motor_lines[12], 0);
-        gpiod_line_set_value(motor_lines[13], 0);
-        gpiod_line_set_value(motor_lines[14], 1);
-        gpiod_line_set_value(motor_lines[15], 1);
-
-        usleep(1000000);
-
-        gpiod_line_set_value(motor_lines[14], 0);
-        gpiod_line_set_value(motor_lines[15], 0);
-
-        gpiod_line_set_value(motor_lines[11], 0);
-        gpiod_line_set_value(motor_lines[10], 0);
-        gpiod_line_set_value(motor_lines[8], 1);
-        gpiod_line_set_value(motor_lines[9], 1);
-
-        usleep(1000000);
-
-        gpiod_line_set_value(motor_lines[8], 0);
-        gpiod_line_set_value(motor_lines[9], 0);
-
-        gpiod_line_set_value(motor_lines[11], 1);
-        gpiod_line_set_value(motor_lines[10], 1);
-        gpiod_line_set_value(motor_lines[8], 0);
-        gpiod_line_set_value(motor_lines[9], 0);
-
-        usleep(1000000);
-
-        gpiod_line_set_value(motor_lines[11], 0);
-        gpiod_line_set_value(motor_lines[10], 0);
-
-        gpiod_line_set_value(motor_lines[12], 1);
-        gpiod_line_set_value(motor_lines[13], 1);
-        gpiod_line_set_value(motor_lines[14], 0);
-        gpiod_line_set_value(motor_lines[15], 0);
-
-        usleep(1000000);
-
-        gpiod_line_set_value(motor_lines[12], 0);
-        gpiod_line_set_value(motor_lines[13], 0);
-    }
-}
-
-// ------------------- timer tick (time + auto reload + dispense checks) -------------------
-static gboolean tick_update_time(gpointer user_data) {
-    App *app = (App *)user_data;
-    if (app->time_label_main) set_label_to_now(app->time_label_main);
-    if (app->time_label_timepage) set_label_to_now(app->time_label_timepage);
-    if (app->wifi_time_label) set_label_to_now(app->wifi_time_label);
-
-    // Auto-reload schedule file if changed (e.g., edited via M5 web)
-    static time_t last_mtime = 0;
-    if (schedule_file_changed(&last_mtime)) {
-        load_schedules(app);
-        update_main_schedule_labels(app);
-        // If user is on schedules page, refresh spins too
-        fill_schedule_spins_from_data(app);
-    }
-
-    // Dispense check: only once per minute
-    static int last_dispense_minute = -1;
-
-    time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-    if (!t) return TRUE;
-
-    if (t->tm_min == last_dispense_minute) return TRUE;
-    last_dispense_minute = t->tm_min;
-
-    int today = t->tm_wday; // Mon=0..Sun=6 in Linux localtime
-    // NOTE: Linux tm_wday is Sun=0..Sat=6. We need Mon=0..Sun=6.
-    // Convert:
-    today = (t->tm_wday + 6) % 7;
-
-    if (t->tm_hour == app->slot1[today].h && t->tm_min == app->slot1[today].m) {
-        dispense(1);
-    }
-    if (t->tm_hour == app->slot2[today].h && t->tm_min == app->slot2[today].m) {
-        dispense(2);
-    }
-
-    return TRUE;
-}
-
 // ------------------- MAIN -------------------
 int main(int argc, char **argv) {
     App app;
@@ -1209,13 +1257,8 @@ int main(int argc, char **argv) {
     show_main(&app);
     update_main_schedule_labels(&app);
 
-    chip = gpiod_chip_open("/dev/gpiochip0");
-    if (!chip) return 1;
-
-    for (int i = 0; i < 16; i++) {
-        motor_lines[i] = gpiod_chip_get_line(chip, motor_pins[i]);
-        gpiod_line_request_output(motor_lines[i], "Pill-Dispenser", 0);
-    }
+    // Setup GPIO outputs via raspi-gpio
+    gpio_setup_outputs();
 
     g_timeout_add(1000, tick_update_time, &app);
     tick_update_time(&app);
