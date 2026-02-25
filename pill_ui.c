@@ -1207,7 +1207,8 @@ int main(int argc, char **argv) {
         gpiod_line_request_output(motor_lines[i], "Pill-Dispenser", 0);
         }
 
-    dispense(1); //Adding for a test, delete this
+    //dispense(1); //Adding for a test, delete this
+    system("curl -s http://192.168.1.50/trigger > /dev/null"); //Also for testing probably should use something that can be retried if it fails for a better implementation
 
     g_timeout_add(1000, tick_update_time, &app);
     tick_update_time(&app);

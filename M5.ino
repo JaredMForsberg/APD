@@ -20,12 +20,6 @@ WebServer server(80);
 bool wifiOk = false;
 bool timeOk = false;               // set true once NTP time is obtained
 
-// Alarm state (scheduler based on CST/CDT time)
-bool alarmSet = false;
-time_t alarmEpoch = 0;             // absolute local time when alarm should fire
-int alarmHour = -1;                // scheduled hour (0–23)
-int alarmMinute = -1;              // scheduled minute (0–59)
-
 // Buzzer state (for LEDC)
 bool buzzerReady = false;
 
@@ -305,21 +299,6 @@ void handleRoot() {
   server.send(200, "text/html", html);
 }
 
-// ========== HTTP: /set?hour=HH&minute=MM ==========
-void handleSetAlarm() {
-  if (!server.hasArg("hour") || !server.hasArg("minute")) {
-    server.send(400, "text/plain", "Missing 'hour' or 'minute' parameter");
-    return;
-  }
-
-  int hour = server.arg("hour").toInt();
-  int minute = server.arg("minute").toInt();
-
-  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
-    server.send(400, "text/plain", "Invalid time");
-    return;
-  }
-
   struct tm nowInfo;
   if (!getLocalTime(&nowInfo)) {
     server.send(500, "text/plain", "Time not available (NTP error)");
@@ -443,7 +422,7 @@ void setup() {
 
   if (wifiOk) {
     server.on("/", handleRoot);
-    server.on("/set", handleSetAlarm);
+    server.on("/trigger", handleTrigger);
     server.begin();
     Serial.println("HTTP server started");
   }
@@ -454,6 +433,21 @@ void setup() {
   lastTimeUpdateMs = millis();
 }
 
+// ========== Auto Trigger ==========
+void handleTrigger() {
+
+  M5.Lcd.fillScreen(BLACK);
+  M5.Lcd.setTextSize(3);
+  M5.Lcd.setCursor(5, 5);
+  M5.Lcd.println("ALARM!");
+  
+  int pct = getBatteryPercent();
+  drawBatteryIconTopRight(pct);
+
+  buzzerAlert();
+
+  showCurrentTimeOnScreen();  // return to clock after buzzing
+}
 // ========== Arduino loop ==========
 void loop() {
   M5.update();
@@ -468,36 +462,6 @@ void loop() {
     if (nowMs - lastTimeUpdateMs >= 1000) {
       lastTimeUpdateMs = nowMs;
       showCurrentTimeOnScreen();
-    }
-  }
-
-  // Check if alarm should fire based on scheduled CST/CDT time
-  if (alarmSet && timeOk) {
-    struct tm nowInfo;
-    if (getLocalTime(&nowInfo)) {
-      time_t nowEpoch = mktime(&nowInfo);
-      if (nowEpoch >= alarmEpoch) {
-        alarmSet = false;          // clear alarm so it doesn't retrigger
-        showingTime = false;       // stop clock updates while we show ALARM
-
-        // Show ALARM first
-        M5.Lcd.fillScreen(BLACK);
-        M5.Lcd.setCursor(5, 5);
-        M5.Lcd.setTextSize(3);
-        M5.Lcd.println("ALARM!");
-
-        // Battery on ALARM screen too
-        int pct = getBatteryPercent();
-        drawBatteryIconTopRight(pct);
-
-        // Buzz for ~10 seconds
-        buzzerAlert();
-
-        // After alarm finishes, switch into clock mode and auto-update
-        showCurrentTimeOnScreen();
-        showingTime = true;
-        lastTimeUpdateMs = millis();
-      }
     }
   }
 }
