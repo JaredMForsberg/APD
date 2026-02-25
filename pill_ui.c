@@ -4,7 +4,7 @@
 // + Admin Extract (copy admin log to selected USB drive)
 //
 // Compile:
-//   gcc -std=gnu99 /home/autopilldispense/Desktop/pill_ui.c -o /home/autopilldispense/Desktop/pill_ui $(pkg-config --cflags --libs gtk+-3.0)
+//   gcc -std=gnu99 /home/autopilldispense/Desktop/pill_ui.c -o /home/autopilldispense/Desktop/pill_ui $(pkg-config --cflags --libs gtk+-3.0) -lgpiod
 //
 // Run:
 //   /home/autopilldispense/Desktop/pill_ui
@@ -15,8 +15,9 @@
 #include <string.h>
 #include <ctype.h>
 #include <sys/stat.h>
-#include <gpiod.h> //For GPIO activation
-#include <stdio.h> 
+#include <gpiod.h>
+#include <stdio.h>
+#include <unistd.h>
 
 #define DEV_FILE_PATH "/home/autopilldispense/Desktop/pill_ui.c"
 #define SCHEDULE_FILE ".pill_dispenser_schedule.txt"
@@ -26,7 +27,7 @@ static const char *DAYS[7] = {"Mon","Tue","Wed","Thu","Fri","Sat","Sun"};
 
 static int motor_pins[16] = {17, 27, 22, 5, 6, 13, 19, 26, 18, 23, 24, 25, 12, 16, 20, 21};
 struct gpiod_line *motor_lines[16];
-static int reserved_pins [8] = {2, 3, 14, 15, 7, 8, 9, 10}; //for future use with keypad, could swap for 11 for one of these and maybe 4 
+static int reserved_pins [8] = {2, 3, 14, 15, 7, 8, 9, 10};
 
 struct gpiod_chip *chip;
 
@@ -77,7 +78,7 @@ typedef struct {
 
 } App;
 
-void dispense (int);
+void dispense(int slot);
 
 // ------------------- helpers -------------------
 static void trim(char *s) {
@@ -106,37 +107,6 @@ static void set_label_to_now(GtkWidget *label) {
     char buf[128];
     strftime(buf, sizeof(buf), "%a %b %d %Y  %I:%M:%S %p", lt);
     gtk_label_set_text(GTK_LABEL(label), buf);
-}
-
-static gboolean tick_update_time(gpointer user_data) {
-    App *app = (App *)user_data;
-    if (app->time_label_main) set_label_to_now(app->time_label_main);
-    if (app->time_label_timepage) set_label_to_now(app->time_label_timepage);
-    if (app->wifi_time_label) set_label_to_now(app->wifi_time_label);
-    
-    //#TODO: will need a way to make it not occur 60 times in a row. probably a way to just check the day first and then go to that slot?
-    static int last_dispense_minute = -1;
-    
-    time_t now = time(NULL);
-    struct tm *t = localtime(&now); //gets current time
-    
-    if (t->tm_min == last_dispense_minute) {
-        return TRUE; //return early if already checked this minute
-    } else {
-        last_dispense_minute = t->tm_min; //otherwise set the variable so that next time we wont check for a dispense
-    }
-     //does conversion so that monday is first day of the week, can be removed if we put sunday as first in the UI
-     int today = (t->tm_wday +6) % 7;
-    //Checks the day hour and time for dispense, first for slot 1 , then slot 2, will need to update once we do more than one pill per dispense.
-    if (t->tm_hour == app->slot1[today].h && t->tm_min == app->slot1[today].m) {
-        dispense(1);
-    }
-    
-    if (t->tm_hour == app->slot2[today].h && t->tm_min == app->slot2[today].m) {
-        dispense(2);
-    }
-    
-    return TRUE;
 }
 
 static void show_page(App *app, const char *name) {
@@ -248,6 +218,25 @@ static void update_main_schedule_labels(App *app) {
         gtk_label_set_text(GTK_LABEL(app->main_sched_labels[i][0]), a);
         gtk_label_set_text(GTK_LABEL(app->main_sched_labels[i][1]), b);
     }
+}
+
+// Watch schedule file changes (so M5 edits show up without restart)
+static gboolean schedule_file_changed(time_t *last_mtime_out) {
+    char path[512];
+    get_schedule_path(path, sizeof(path));
+
+    struct stat st;
+    if (stat(path, &st) != 0) return FALSE;
+
+    if (*last_mtime_out == 0) {
+        *last_mtime_out = st.st_mtime;
+        return FALSE;
+    }
+    if (st.st_mtime != *last_mtime_out) {
+        *last_mtime_out = st.st_mtime;
+        return TRUE;
+    }
+    return FALSE;
 }
 
 // ------------------- admin logging -------------------
@@ -545,7 +534,7 @@ static void on_wifi_connect(GtkWidget *widget, gpointer user_data) {
         snprintf(cmd, sizeof(cmd),
                  "pkexec nmcli dev wifi connect \"%s\"",
                  app->wifi_selected_ssid);
-                     }
+    }
 
     ui_set_status(app->wifi_status_label, "Connecting... (auth prompt may appear)");
     int rc = system(cmd);
@@ -586,7 +575,7 @@ static void on_admin_reset(GtkWidget *w, gpointer user_data) {
 
     set_default_schedules(app);
     save_schedules(app);
-    admin_log_clear();                 // wipe logs
+    admin_log_clear();
     admin_log_append_snapshot(app, "Admin reset (defaults applied)");
 
     update_main_schedule_labels(app);
@@ -604,8 +593,6 @@ static void usb_clear_store(App *app) {
 static void usb_scan_mounted(App *app) {
     usb_clear_store(app);
 
-    // We list mounted removable/USB drives via lsblk
-    // NAME LABEL MOUNTPOINT RM TRAN
     FILE *fp = popen("lsblk -o NAME,LABEL,MOUNTPOINT,RM,TRAN -nr 2>/dev/null", "r");
     if (!fp) {
         ui_set_status(app->admin_status_label, "Failed to scan drives.");
@@ -619,19 +606,11 @@ static void usb_scan_mounted(App *app) {
         trim(line);
         if (!line[0]) continue;
 
-        // Parse: name label mount rm tran
-        // Note: LABEL can be empty, so we do a more forgiving parse by splitting from end.
-        // We'll token-split and then rebuild.
         char name[64]={0}, label[128]={0}, mount[512]={0}, rm[8]={0}, tran[32]={0};
-
-        // easiest: read 5 tokens; if label is empty, lsblk still prints something, but can collapse.
-        // We'll use sscanf with wide fields; if it fails, skip.
         if (sscanf(line, "%63s %127s %511s %7s %31s", name, label, mount, rm, tran) < 4) continue;
 
-        // If mountpoint is "-", treat as not mounted
         if (strcmp(mount, "-") == 0) continue;
 
-        // Must be removable or usb transport
         int is_rm = (strcmp(rm, "1") == 0);
         int is_usb = (strcmp(tran, "usb") == 0);
 
@@ -641,7 +620,6 @@ static void usb_scan_mounted(App *app) {
         gtk_list_store_append(app->usb_store, &iter);
 
         char display[900];
-        // If label looks like a mountpoint (due to weird tokenization), still show something useful
         snprintf(display, sizeof(display), "%s  (%s)  →  %s", name, label, mount);
 
         gtk_list_store_set(app->usb_store, &iter,
@@ -693,7 +671,6 @@ static void on_admin_extract_export(GtkWidget *w, gpointer user_data) {
         return;
     }
 
-    // Ensure admin.txt exists (create if missing)
     FILE *f = fopen(ADMIN_LOG_PATH, "a");
     if (f) fclose(f);
 
@@ -797,7 +774,6 @@ static GtkWidget *build_settings_page(App *app) {
     gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
     gtk_box_pack_start(GTK_BOX(root), grid, TRUE, TRUE, 0);
 
-    // 6 icons now
     const char *ids[6]    = {"schedules","time_date","wifi","dev","admin_extract","admin_reset"};
     const char *labels[6] = {"Schedules","Time & Date","Wi-Fi Config","Dev: Edit Code","Admin Extract","Admin Reset"};
     const char *icons[6]  = {"x-office-calendar","preferences-system-time","network-wireless","accessories-text-editor","document-send","edit-clear"};
@@ -1040,7 +1016,6 @@ static GtkWidget *build_admin_extract_page(App *app) {
     gtk_box_pack_end(GTK_BOX(top), rescan, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(root), top, FALSE, FALSE, 0);
 
-    // USB list
     app->usb_store = gtk_list_store_new(2, G_TYPE_STRING, G_TYPE_STRING);
     app->usb_tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(app->usb_store));
     gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(app->usb_tree), TRUE);
@@ -1074,95 +1049,131 @@ static GtkWidget *build_admin_extract_page(App *app) {
     return root;
 }
 
-// ------------Dispenser Helper ---------------
-//dispense logic, checks the slot, then actuates pull back, push out, pull back, push out sequentially
-//could remove redundency but this allows for confirmation other pins are off
-void dispense (int slot) {
+// ------------ Dispenser Helper ---------------
+void dispense(int slot) {
     if (slot == 1) {
         gpiod_line_set_value(motor_lines[4], 0);
         gpiod_line_set_value(motor_lines[5], 0);
         gpiod_line_set_value(motor_lines[6], 1);
         gpiod_line_set_value(motor_lines[7], 1);
-        
-        usleep(1000000);//change to match delay needed for motor
-        
+
+        usleep(1000000);
+
         gpiod_line_set_value(motor_lines[6], 0);
         gpiod_line_set_value(motor_lines[7], 0);
-        
+
         gpiod_line_set_value(motor_lines[3], 0);
         gpiod_line_set_value(motor_lines[2], 0);
         gpiod_line_set_value(motor_lines[0], 1);
         gpiod_line_set_value(motor_lines[1], 1);
-        
+
         usleep(1000000);
-        
+
         gpiod_line_set_value(motor_lines[0], 0);
         gpiod_line_set_value(motor_lines[1], 0);
-        
+
         gpiod_line_set_value(motor_lines[3], 1);
         gpiod_line_set_value(motor_lines[2], 1);
         gpiod_line_set_value(motor_lines[0], 0);
         gpiod_line_set_value(motor_lines[1], 0);
-        
+
         usleep(1000000);
-        
+
         gpiod_line_set_value(motor_lines[3], 0);
         gpiod_line_set_value(motor_lines[2], 0);
-        
+
         gpiod_line_set_value(motor_lines[4], 1);
         gpiod_line_set_value(motor_lines[5], 1);
         gpiod_line_set_value(motor_lines[6], 0);
         gpiod_line_set_value(motor_lines[7], 0);
-        
+
         usleep(1000000);
-        
+
         gpiod_line_set_value(motor_lines[4], 0);
         gpiod_line_set_value(motor_lines[5], 0);
-        
-    }else if (slot == 2) {
-        
+
+    } else if (slot == 2) {
         gpiod_line_set_value(motor_lines[12], 0);
         gpiod_line_set_value(motor_lines[13], 0);
         gpiod_line_set_value(motor_lines[14], 1);
         gpiod_line_set_value(motor_lines[15], 1);
-        
-        usleep(1000000);//change to match delay needed for motor
-        
+
+        usleep(1000000);
+
         gpiod_line_set_value(motor_lines[14], 0);
         gpiod_line_set_value(motor_lines[15], 0);
-        
+
         gpiod_line_set_value(motor_lines[11], 0);
         gpiod_line_set_value(motor_lines[10], 0);
         gpiod_line_set_value(motor_lines[8], 1);
         gpiod_line_set_value(motor_lines[9], 1);
-        
+
         usleep(1000000);
-        
+
         gpiod_line_set_value(motor_lines[8], 0);
         gpiod_line_set_value(motor_lines[9], 0);
-        
+
         gpiod_line_set_value(motor_lines[11], 1);
         gpiod_line_set_value(motor_lines[10], 1);
         gpiod_line_set_value(motor_lines[8], 0);
         gpiod_line_set_value(motor_lines[9], 0);
-        
+
         usleep(1000000);
-        
+
         gpiod_line_set_value(motor_lines[11], 0);
         gpiod_line_set_value(motor_lines[10], 0);
-        
+
         gpiod_line_set_value(motor_lines[12], 1);
         gpiod_line_set_value(motor_lines[13], 1);
         gpiod_line_set_value(motor_lines[14], 0);
-        gpiod_line_set_value(motor_lines[15], 0);        
-        
+        gpiod_line_set_value(motor_lines[15], 0);
+
         usleep(1000000);
-        
+
         gpiod_line_set_value(motor_lines[12], 0);
         gpiod_line_set_value(motor_lines[13], 0);
-        
+    }
+}
+
+// ------------------- timer tick (time + auto reload + dispense checks) -------------------
+static gboolean tick_update_time(gpointer user_data) {
+    App *app = (App *)user_data;
+    if (app->time_label_main) set_label_to_now(app->time_label_main);
+    if (app->time_label_timepage) set_label_to_now(app->time_label_timepage);
+    if (app->wifi_time_label) set_label_to_now(app->wifi_time_label);
+
+    // Auto-reload schedule file if changed (e.g., edited via M5 web)
+    static time_t last_mtime = 0;
+    if (schedule_file_changed(&last_mtime)) {
+        load_schedules(app);
+        update_main_schedule_labels(app);
+        // If user is on schedules page, refresh spins too
+        fill_schedule_spins_from_data(app);
     }
 
+    // Dispense check: only once per minute
+    static int last_dispense_minute = -1;
+
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    if (!t) return TRUE;
+
+    if (t->tm_min == last_dispense_minute) return TRUE;
+    last_dispense_minute = t->tm_min;
+
+    int today = t->tm_wday; // Mon=0..Sun=6 in Linux localtime
+    // NOTE: Linux tm_wday is Sun=0..Sat=6. We need Mon=0..Sun=6.
+    // Convert:
+    today = (t->tm_wday + 6) % 7;
+
+    if (t->tm_hour == app->slot1[today].h && t->tm_min == app->slot1[today].m) {
+        dispense(1);
+    }
+    if (t->tm_hour == app->slot2[today].h && t->tm_min == app->slot2[today].m) {
+        dispense(2);
+    }
+
+    return TRUE;
 }
 
 // ------------------- MAIN -------------------
@@ -1199,16 +1210,12 @@ int main(int argc, char **argv) {
     update_main_schedule_labels(&app);
 
     chip = gpiod_chip_open("/dev/gpiochip0");
-    if(!chip) {
-        return 1; //failure to open GPIO chip, cannot continue
-    }
-    for (int i = 0; i<16; i++) {
+    if (!chip) return 1;
+
+    for (int i = 0; i < 16; i++) {
         motor_lines[i] = gpiod_chip_get_line(chip, motor_pins[i]);
         gpiod_line_request_output(motor_lines[i], "Pill-Dispenser", 0);
-        }
-
-    //dispense(1); //Adding for a test, delete this
-    system("curl -s http://192.168.1.50/trigger > /dev/null"); //Also for testing probably should use something that can be retried if it fails for a better implementation
+    }
 
     g_timeout_add(1000, tick_update_time, &app);
     tick_update_time(&app);
@@ -1217,3 +1224,4 @@ int main(int argc, char **argv) {
     gtk_main();
     return 0;
 }
+
