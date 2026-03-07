@@ -4,8 +4,15 @@
 // + Admin Extract (copy admin log to selected USB drive)
 // + Admin Extract is gated by Pi user's password via pkexec (no separate admin password)
 //
-// NOTE: Motor GPIO control uses the built-in `raspi-gpio` command.
-// That means you DO NOT need libgpiod, and you should NOT compile with -lgpiod.
+// UPDATED CLEANER VERSION:
+// - Main screen shows ONLY today's schedule
+// - Only active time slots are shown on main screen
+// - If no times are set today, main screen shows: "No time slots set for today."
+// - Each day supports up to 10 dispense times for Slot 1
+// - Each day supports up to 10 dispense times for Slot 2
+// - Scheduler page has + / - buttons for each day + slot to add/remove visible time rows
+// - Uses enabled flags internally so empty rows stay hidden/unused
+// - Default for every day/slot is now 0 visible rows
 //
 // Compile:
 //   gcc -std=gnu99 -O2 -Wall -Wextra /home/autopilldispense/Desktop/pill_ui.c -o /home/autopilldispense/Desktop/pill_ui $(pkg-config --cflags --libs gtk+-3.0)
@@ -26,13 +33,16 @@
 #define DEV_FILE_PATH   "/home/autopilldispense/Desktop/pill_ui.c"
 #define SCHEDULE_FILE   ".pill_dispenser_schedule.txt"
 #define ADMIN_LOG_PATH  "/home/autopilldispense/Desktop/admin.txt"
+#define MAX_TIMES       10
 
 static const char *DAYS[7] = {"Mon","Tue","Wed","Thu","Fri","Sat","Sun"};
-
-// Your original motor pins array (kept same)
 static int motor_pins[16] = {17, 27, 22, 5, 6, 13, 19, 26, 18, 23, 24, 25, 12, 16, 20, 21};
 
-typedef struct { int h; int m; } HM;
+typedef struct {
+    int h;
+    int m;
+    int enabled;
+} HM;
 
 typedef struct {
     GtkWidget *window;
@@ -40,14 +50,17 @@ typedef struct {
 
     // Main page
     GtkWidget *time_label_main;
-    GtkWidget *main_sched_labels[7][2];
+    GtkWidget *today_sched_title;
+    GtkWidget *today_sched_box;
+    GtkWidget *today_empty_label;
 
-    // Schedule data
-    HM slot1[7];
-    HM slot2[7];
+    // Schedule data [day][slot][time_index]
+    HM slot_times[7][2][MAX_TIMES];
+    int visible_count[7][2]; // how many rows are visible in scheduler UI per day/slot
 
-    // Schedules page
-    GtkWidget *sched_spin[7][2][2]; // [day][slot][hm] hm 0=hour 1=min
+    // Schedule UI
+    GtkWidget *sched_rows[7][2][MAX_TIMES];
+    GtkWidget *sched_spin[7][2][MAX_TIMES][2];
     GtkWidget *sched_status_label;
 
     // Time & Date page
@@ -72,12 +85,18 @@ typedef struct {
 
     // Admin Extract page
     GtkWidget *admin_status_label;
-    GtkListStore *usb_store;     // columns: 0=display, 1=mountpoint
+    GtkListStore *usb_store;
     GtkWidget *usb_tree;
     GtkWidget *usb_selected_label;
     char usb_selected_mount[512];
 
 } App;
+
+typedef struct {
+    App *app;
+    int day;
+    int slot;
+} DaySlotRef;
 
 // ------------------- helpers -------------------
 static void trim(char *s) {
@@ -119,10 +138,16 @@ static void show_page(App *app, const char *name) {
 static void show_main(App *app)     { show_page(app, "main"); }
 static void show_settings(App *app) { show_page(app, "settings"); }
 
-// ------------------- UI helpers -------------------
+static int get_today_index(void) {
+    time_t now = time(NULL);
+    struct tm *lt = localtime(&now);
+    if (!lt) return 0;
+    return (lt->tm_wday + 6) % 7; // Mon=0..Sun=6
+}
+
 static GtkWidget *make_cell_label(const char *text, gboolean header) {
     GtkWidget *lbl = gtk_label_new(text);
-    gtk_label_set_xalign(GTK_LABEL(lbl), 0.5f);
+    gtk_label_set_xalign(GTK_LABEL(lbl), 0.0f);
     if (header) {
         char markup[256];
         snprintf(markup, sizeof(markup), "<b>%s</b>", text);
@@ -147,11 +172,50 @@ static GtkWidget *make_spin(int min, int max, int step) {
     return spin;
 }
 
+static int schedule_entry_is_active(const HM *t) {
+    return t && t->enabled;
+}
+
+static int time_compare(const void *a, const void *b) {
+    const HM *ta = (const HM *)a;
+    const HM *tb = (const HM *)b;
+
+    if (!ta->enabled && !tb->enabled) return 0;
+    if (!ta->enabled) return 1;
+    if (!tb->enabled) return -1;
+
+    int ma = ta->h * 60 + ta->m;
+    int mb = tb->h * 60 + tb->m;
+    return ma - mb;
+}
+
+static void sort_slot_times(App *app, int day, int slot) {
+    qsort(app->slot_times[day][slot], MAX_TIMES, sizeof(HM), time_compare);
+}
+
+static void update_visible_count_from_data(App *app) {
+    for (int d = 0; d < 7; d++) {
+        for (int s = 0; s < 2; s++) {
+            int count = 0;
+            for (int i = 0; i < MAX_TIMES; i++) {
+                if (app->slot_times[d][s][i].enabled) count++;
+            }
+            app->visible_count[d][s] = count; // allow 0
+        }
+    }
+}
+
 // ------------------- schedules persistence -------------------
 static void set_default_schedules(App *app) {
-    for (int i = 0; i < 7; i++) {
-        app->slot1[i].h = 8;  app->slot1[i].m = 0;
-        app->slot2[i].h = 20; app->slot2[i].m = 0;
+    for (int d = 0; d < 7; d++) {
+        for (int s = 0; s < 2; s++) {
+            app->visible_count[d][s] = 0;
+            for (int i = 0; i < MAX_TIMES; i++) {
+                app->slot_times[d][s][i].h = 8;
+                app->slot_times[d][s][i].m = 0;
+                app->slot_times[d][s][i].enabled = 0;
+            }
+        }
     }
 }
 
@@ -161,82 +225,220 @@ static void get_schedule_path(char *out, size_t outsz) {
     snprintf(out, outsz, "%s/%s", home, SCHEDULE_FILE);
 }
 
-static int load_schedules(App *app) {
-    char path[512];
-    get_schedule_path(path, sizeof(path));
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
-
-    char line[256];
-    int seen = 0;
-
-    while (fgets(line, sizeof(line), f)) {
-        char day[16];
-        int h1, m1, h2, m2;
-        trim(line);
-        if (!line[0]) continue;
-
-        if (sscanf(line, "%15s %d:%d %d:%d", day, &h1, &m1, &h2, &m2) == 5) {
-            for (int i = 0; i < 7; i++) {
-                if (strcmp(day, DAYS[i]) == 0) {
-                    if (h1>=0 && h1<=23 && m1>=0 && m1<=59 && h2>=0 && h2<=23 && m2>=0 && m2<=59) {
-                        app->slot1[i].h = h1; app->slot1[i].m = m1;
-                        app->slot2[i].h = h2; app->slot2[i].m = m2;
-                        seen++;
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    fclose(f);
-    return (seen > 0);
-}
-
 static int save_schedules(App *app) {
     char path[512];
     get_schedule_path(path, sizeof(path));
     FILE *f = fopen(path, "w");
     if (!f) return 0;
 
-    for (int i = 0; i < 7; i++) {
-        fprintf(f, "%s %02d:%02d %02d:%02d\n",
-                DAYS[i],
-                app->slot1[i].h, app->slot1[i].m,
-                app->slot2[i].h, app->slot2[i].m);
+    for (int d = 0; d < 7; d++) {
+        fprintf(f, "%s ", DAYS[d]);
+
+        for (int i = 0; i < MAX_TIMES; i++) {
+            HM *t = &app->slot_times[d][0][i];
+            fprintf(f, "%d:%02d:%02d ", t->enabled, t->h, t->m);
+        }
+
+        fprintf(f, "| ");
+
+        for (int i = 0; i < MAX_TIMES; i++) {
+            HM *t = &app->slot_times[d][1][i];
+            fprintf(f, "%d:%02d:%02d ", t->enabled, t->h, t->m);
+        }
+
+        fprintf(f, "\n");
     }
+
     fclose(f);
     return 1;
 }
 
-static void update_main_schedule_labels(App *app) {
+static int load_new_schedule_format(App *app, const char *line_in) {
+    char line[2048];
+    strncpy(line, line_in, sizeof(line) - 1);
+    line[sizeof(line) - 1] = 0;
+    trim(line);
+    if (!line[0]) return 0;
+
+    char day[16];
+    char *p = line;
+
+    if (sscanf(p, "%15s", day) != 1) return 0;
+
+    int d = -1;
     for (int i = 0; i < 7; i++) {
-        char a[16], b[16];
-        snprintf(a, sizeof(a), "%02d:%02d", app->slot1[i].h, app->slot1[i].m);
-        snprintf(b, sizeof(b), "%02d:%02d", app->slot2[i].h, app->slot2[i].m);
-        gtk_label_set_text(GTK_LABEL(app->main_sched_labels[i][0]), a);
-        gtk_label_set_text(GTK_LABEL(app->main_sched_labels[i][1]), b);
+        if (strcmp(day, DAYS[i]) == 0) {
+            d = i;
+            break;
+        }
     }
+    if (d < 0) return 0;
+
+    p = strchr(p, ' ');
+    if (!p) return 0;
+    p++;
+
+    for (int s = 0; s < 2; s++) {
+        for (int i = 0; i < MAX_TIMES; i++) {
+            while (*p == ' ') p++;
+            if (s == 1 && *p == '|') p++;
+            while (*p == ' ') p++;
+
+            int en, h, m;
+            if (sscanf(p, "%d:%d:%d", &en, &h, &m) != 3) return 0;
+            if (en < 0 || en > 1 || h < 0 || h > 23 || m < 0 || m > 59) return 0;
+
+            app->slot_times[d][s][i].enabled = en;
+            app->slot_times[d][s][i].h = h;
+            app->slot_times[d][s][i].m = m;
+
+            while (*p && *p != ' ') p++;
+        }
+
+        if (s == 0) {
+            while (*p == ' ') p++;
+            if (*p == '|') p++;
+        }
+    }
+
+    return 1;
 }
 
-// Watch schedule file changes (so M5 edits show up without restart)
-static gboolean schedule_file_changed(time_t *last_mtime_out) {
+// legacy support: Mon 08:00 20:00
+static int load_old_schedule_format(App *app, const char *line_in) {
+    char day[16];
+    int h1, m1, h2, m2;
+    if (sscanf(line_in, "%15s %d:%d %d:%d", day, &h1, &m1, &h2, &m2) != 5) {
+        return 0;
+    }
+
+    int d = -1;
+    for (int i = 0; i < 7; i++) {
+        if (strcmp(day, DAYS[i]) == 0) {
+            d = i;
+            break;
+        }
+    }
+    if (d < 0) return 0;
+
+    for (int s = 0; s < 2; s++) {
+        for (int i = 0; i < MAX_TIMES; i++) {
+            app->slot_times[d][s][i].enabled = 0;
+            app->slot_times[d][s][i].h = 8;
+            app->slot_times[d][s][i].m = 0;
+        }
+    }
+
+    if (h1 >= 0 && h1 <= 23 && m1 >= 0 && m1 <= 59) {
+        app->slot_times[d][0][0].enabled = 1;
+        app->slot_times[d][0][0].h = h1;
+        app->slot_times[d][0][0].m = m1;
+    }
+
+    if (h2 >= 0 && h2 <= 23 && m2 >= 0 && m2 <= 59) {
+        app->slot_times[d][1][0].enabled = 1;
+        app->slot_times[d][1][0].h = h2;
+        app->slot_times[d][1][0].m = m2;
+    }
+
+    return 1;
+}
+
+static int load_schedules(App *app) {
     char path[512];
     get_schedule_path(path, sizeof(path));
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
 
-    struct stat st;
-    if (stat(path, &st) != 0) return FALSE;
+    char line[2048];
+    int seen = 0;
 
-    if (*last_mtime_out == 0) {
-        *last_mtime_out = st.st_mtime;
-        return FALSE;
+    while (fgets(line, sizeof(line), f)) {
+        trim(line);
+        if (!line[0]) continue;
+
+        if (strchr(line, '|') && strstr(line, "0:")) {
+            if (load_new_schedule_format(app, line)) seen++;
+        } else {
+            if (load_old_schedule_format(app, line)) seen++;
+        }
     }
-    if (st.st_mtime != *last_mtime_out) {
-        *last_mtime_out = st.st_mtime;
-        return TRUE;
+
+    fclose(f);
+
+    for (int d = 0; d < 7; d++) {
+        for (int s = 0; s < 2; s++) {
+            sort_slot_times(app, d, s);
+        }
     }
-    return FALSE;
+    update_visible_count_from_data(app);
+    return (seen > 0);
+}
+
+// ------------------- main screen refresh -------------------
+static void rebuild_today_schedule(App *app) {
+    GList *children = gtk_container_get_children(GTK_CONTAINER(app->today_sched_box));
+    for (GList *l = children; l != NULL; l = l->next) {
+        gtk_widget_destroy(GTK_WIDGET(l->data));
+    }
+    g_list_free(children);
+
+    int today = get_today_index();
+
+    char hdr[160];
+    snprintf(hdr, sizeof(hdr),
+             "<span size='x-large' weight='bold'>Today's Schedule - %s</span>",
+             DAYS[today]);
+    gtk_label_set_markup(GTK_LABEL(app->today_sched_title), hdr);
+
+    int total_active = 0;
+    for (int s = 0; s < 2; s++) {
+        for (int i = 0; i < MAX_TIMES; i++) {
+            if (app->slot_times[today][s][i].enabled) total_active++;
+        }
+    }
+
+    if (total_active == 0) {
+        gtk_widget_show(app->today_empty_label);
+        gtk_box_pack_start(GTK_BOX(app->today_sched_box), app->today_empty_label, FALSE, FALSE, 0);
+        gtk_widget_show(app->today_empty_label);
+        gtk_widget_show_all(app->today_sched_box);
+        return;
+    }
+
+    gtk_widget_hide(app->today_empty_label);
+
+    for (int s = 0; s < 2; s++) {
+        GtkWidget *frame = gtk_frame_new(s == 0 ? "Pill Slot 1" : "Pill Slot 2");
+        GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+        gtk_container_set_border_width(GTK_CONTAINER(box), 8);
+        gtk_container_add(GTK_CONTAINER(frame), box);
+
+        int slot_active = 0;
+        for (int i = 0; i < MAX_TIMES; i++) {
+            if (!app->slot_times[today][s][i].enabled) continue;
+            slot_active = 1;
+
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%02d:%02d",
+                     app->slot_times[today][s][i].h,
+                     app->slot_times[today][s][i].m);
+
+            GtkWidget *lbl = gtk_label_new(buf);
+            gtk_label_set_xalign(GTK_LABEL(lbl), 0.0f);
+            gtk_box_pack_start(GTK_BOX(box), lbl, FALSE, FALSE, 0);
+        }
+
+        if (!slot_active) {
+            GtkWidget *lbl = gtk_label_new("No time slots set");
+            gtk_label_set_xalign(GTK_LABEL(lbl), 0.0f);
+            gtk_box_pack_start(GTK_BOX(box), lbl, FALSE, FALSE, 0);
+        }
+
+        gtk_box_pack_start(GTK_BOX(app->today_sched_box), frame, FALSE, FALSE, 0);
+    }
+
+    gtk_widget_show_all(app->today_sched_box);
 }
 
 // ------------------- admin logging -------------------
@@ -248,11 +450,18 @@ static void admin_log_append_snapshot(App *app, const char *reason) {
     now_string(ts, sizeof(ts));
 
     fprintf(f, "=== %s | %s ===\n", ts, reason ? reason : "Schedule update");
-    for (int i = 0; i < 7; i++) {
-        fprintf(f, "%s  Slot1 %02d:%02d  Slot2 %02d:%02d\n",
-                DAYS[i],
-                app->slot1[i].h, app->slot1[i].m,
-                app->slot2[i].h, app->slot2[i].m);
+    for (int d = 0; d < 7; d++) {
+        fprintf(f, "%s  Slot1:", DAYS[d]);
+        for (int i = 0; i < MAX_TIMES; i++) {
+            HM *t = &app->slot_times[d][0][i];
+            if (t->enabled) fprintf(f, " %02d:%02d", t->h, t->m);
+        }
+        fprintf(f, "  |  Slot2:");
+        for (int i = 0; i < MAX_TIMES; i++) {
+            HM *t = &app->slot_times[d][1][i];
+            if (t->enabled) fprintf(f, " %02d:%02d", t->h, t->m);
+        }
+        fprintf(f, "\n");
     }
     fprintf(f, "\n");
     fclose(f);
@@ -265,32 +474,10 @@ static int admin_log_clear(void) {
     return 1;
 }
 
-static int file_copy(const char *src, const char *dst) {
-    FILE *in = fopen(src, "rb");
-    if (!in) return 0;
-    FILE *out = fopen(dst, "wb");
-    if (!out) { fclose(in); return 0; }
-
-    char buf[4096];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
-        if (fwrite(buf, 1, n, out) != n) {
-            fclose(in); fclose(out);
-            return 0;
-        }
-    }
-    fclose(in);
-    fclose(out);
-    return 1;
-}
-
-// ------------------- pkexec auth helper (uses Pi user password prompt) -------------------
+// ------------------- pkexec auth helper -------------------
 static int pkexec_auth_ping(void) {
-    // This triggers polkit auth prompt if needed; returns 0 if authorized.
-    // We do NOT create a new password; it uses the system user's password.
     int rc = system("pkexec /usr/bin/true >/dev/null 2>&1");
     if (rc == -1) return -1;
-    // system() returns shell-style status; treat 0 as OK.
     return (rc == 0) ? 0 : 1;
 }
 
@@ -325,23 +512,93 @@ static void on_dev_edit_clicked(GtkWidget *w, gpointer user_data) {
     system(cmd);
 }
 
-// ------------------- schedules page logic -------------------
+// ------------------- schedule UI logic -------------------
+static void refresh_schedule_day_slot_visibility(App *app, int day, int slot) {
+    int visible = app->visible_count[day][slot];
+    if (visible < 0) visible = 0;
+    if (visible > MAX_TIMES) visible = MAX_TIMES;
+    app->visible_count[day][slot] = visible;
+
+    for (int i = 0; i < MAX_TIMES; i++) {
+        if (!app->sched_rows[day][slot][i]) continue;
+
+        if (i < visible) gtk_widget_show(app->sched_rows[day][slot][i]);
+        else gtk_widget_hide(app->sched_rows[day][slot][i]);
+    }
+}
+
+static void refresh_all_schedule_visibility(App *app) {
+    for (int d = 0; d < 7; d++) {
+        for (int s = 0; s < 2; s++) {
+            refresh_schedule_day_slot_visibility(app, d, s);
+        }
+    }
+}
+
+static void on_slot_add_clicked(GtkWidget *w, gpointer user_data) {
+    (void)w;
+    DaySlotRef *ref = (DaySlotRef *)user_data;
+    App *app = ref->app;
+
+    if (app->visible_count[ref->day][ref->slot] < MAX_TIMES) {
+        int idx = app->visible_count[ref->day][ref->slot];
+        app->slot_times[ref->day][ref->slot][idx].enabled = 1;
+        app->slot_times[ref->day][ref->slot][idx].h = 8;
+        app->slot_times[ref->day][ref->slot][idx].m = 0;
+        app->visible_count[ref->day][ref->slot]++;
+    }
+
+    refresh_schedule_day_slot_visibility(app, ref->day, ref->slot);
+}
+
+static void on_slot_remove_clicked(GtkWidget *w, gpointer user_data) {
+    (void)w;
+    DaySlotRef *ref = (DaySlotRef *)user_data;
+    App *app = ref->app;
+
+    if (app->visible_count[ref->day][ref->slot] > 0) {
+        int idx = app->visible_count[ref->day][ref->slot] - 1;
+        app->slot_times[ref->day][ref->slot][idx].enabled = 0;
+        app->slot_times[ref->day][ref->slot][idx].h = 8;
+        app->slot_times[ref->day][ref->slot][idx].m = 0;
+        app->visible_count[ref->day][ref->slot]--;
+    }
+
+    refresh_schedule_day_slot_visibility(app, ref->day, ref->slot);
+}
+
 static void fill_schedule_spins_from_data(App *app) {
     for (int d = 0; d < 7; d++) {
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(app->sched_spin[d][0][0]), app->slot1[d].h);
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(app->sched_spin[d][0][1]), app->slot1[d].m);
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(app->sched_spin[d][1][0]), app->slot2[d].h);
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(app->sched_spin[d][1][1]), app->slot2[d].m);
+        for (int s = 0; s < 2; s++) {
+            for (int i = 0; i < MAX_TIMES; i++) {
+                gtk_spin_button_set_value(
+                    GTK_SPIN_BUTTON(app->sched_spin[d][s][i][0]),
+                    app->slot_times[d][s][i].h
+                );
+                gtk_spin_button_set_value(
+                    GTK_SPIN_BUTTON(app->sched_spin[d][s][i][1]),
+                    app->slot_times[d][s][i].m
+                );
+            }
+        }
     }
+    refresh_all_schedule_visibility(app);
 }
 
 static void pull_schedule_data_from_spins(App *app) {
     for (int d = 0; d < 7; d++) {
-        app->slot1[d].h = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(app->sched_spin[d][0][0]));
-        app->slot1[d].m = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(app->sched_spin[d][0][1]));
-        app->slot2[d].h = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(app->sched_spin[d][1][0]));
-        app->slot2[d].m = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(app->sched_spin[d][1][1]));
+        for (int s = 0; s < 2; s++) {
+            for (int i = 0; i < MAX_TIMES; i++) {
+                app->slot_times[d][s][i].h =
+                    gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(app->sched_spin[d][s][i][0]));
+                app->slot_times[d][s][i].m =
+                    gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(app->sched_spin[d][s][i][1]));
+                app->slot_times[d][s][i].enabled = (i < app->visible_count[d][s]) ? 1 : 0;
+            }
+            sort_slot_times(app, d, s);
+        }
     }
+    update_visible_count_from_data(app);
 }
 
 static void on_sched_save(GtkWidget *w, gpointer user_data) {
@@ -353,7 +610,8 @@ static void on_sched_save(GtkWidget *w, gpointer user_data) {
     if (save_schedules(app)) {
         admin_log_append_snapshot(app, "Schedule saved");
         gtk_label_set_text(GTK_LABEL(app->sched_status_label), "Saved.");
-        update_main_schedule_labels(app);
+        rebuild_today_schedule(app);
+        fill_schedule_spins_from_data(app);
     } else {
         gtk_label_set_text(GTK_LABEL(app->sched_status_label), "Failed to save schedule file.");
     }
@@ -588,7 +846,7 @@ static void on_admin_reset(GtkWidget *w, gpointer user_data) {
     admin_log_clear();
     admin_log_append_snapshot(app, "Admin reset (defaults applied)");
 
-    update_main_schedule_labels(app);
+    rebuild_today_schedule(app);
     fill_schedule_spins_from_data(app);
 
     ui_set_status(app->admin_status_label, "Reset complete: defaults applied + admin.txt cleared.");
@@ -617,8 +875,6 @@ static void usb_scan_mounted(App *app) {
         if (!line[0]) continue;
 
         char name[64]={0}, label[128]={0}, mount[512]={0}, rm[8]={0}, tran[32]={0};
-        // Some lsblk lines can have empty LABEL; parse safely:
-        // We’ll try: NAME LABEL MOUNTPOINT RM TRAN
         int n = sscanf(line, "%63s %127s %511s %7s %31s", name, label, mount, rm, tran);
         if (n < 4) continue;
 
@@ -633,7 +889,7 @@ static void usb_scan_mounted(App *app) {
         gtk_list_store_append(app->usb_store, &iter);
 
         char display[900];
-        snprintf(display, sizeof(display), "%s  (%s)  →  %s", name, label, mount);
+        snprintf(display, sizeof(display), "%s  (%s)  ->  %s", name, label, mount);
 
         gtk_list_store_set(app->usb_store, &iter,
                            0, display,
@@ -683,14 +939,12 @@ static void on_admin_extract_export(GtkWidget *w, gpointer user_data) {
         return;
     }
 
-    // Require Pi user's password (polkit) before exporting
     int auth = pkexec_auth_ping();
     if (auth != 0) {
         ui_set_status(app->admin_status_label, "Export cancelled (auth required).");
         return;
     }
 
-    // Make sure file exists
     FILE *f = fopen(ADMIN_LOG_PATH, "a");
     if (f) fclose(f);
 
@@ -700,8 +954,6 @@ static void on_admin_extract_export(GtkWidget *w, gpointer user_data) {
     char outpath[1024];
     snprintf(outpath, sizeof(outpath), "%s/pill_admin_export_%s.txt", app->usb_selected_mount, stamp);
 
-    // Use pkexec to copy (ensures permission prompt uses Pi user password)
-    // NOTE: To avoid tricky shell escaping, we disallow quotes in mountpoint.
     if (strchr(outpath, '"') || strchr(ADMIN_LOG_PATH, '"')) {
         ui_set_status(app->admin_status_label, "Export failed: invalid path (quotes not allowed).");
         return;
@@ -723,12 +975,8 @@ static void on_admin_extract_export(GtkWidget *w, gpointer user_data) {
 }
 
 static void show_admin_extract(App *app) {
-    // Require auth just to open this page (like “admin password prompt” but using Pi user password)
     int auth = pkexec_auth_ping();
-    if (auth != 0) {
-        // If they cancel auth, just stay in settings.
-        return;
-    }
+    if (auth != 0) return;
 
     ui_set_status(app->admin_status_label, "");
     usb_scan_mounted(app);
@@ -737,10 +985,8 @@ static void show_admin_extract(App *app) {
 
 // ------------------- GPIO via raspi-gpio -------------------
 static void gpio_setup_outputs(void) {
-    // Set each motor pin to output and default low
     for (int i = 0; i < 16; i++) {
         char cmd[128];
-        // op = output, dl = drive low
         snprintf(cmd, sizeof(cmd), "raspi-gpio set %d op dl", motor_pins[i]);
         system(cmd);
     }
@@ -752,11 +998,8 @@ static void gpio_write(int pin, int value) {
     system(cmd);
 }
 
-// ------------ Dispenser Helper ---------------
-// This keeps your SAME pattern, just swaps gpiod_line_set_value -> raspi-gpio writes.
 static void dispense(int slot) {
     if (slot == 1) {
-        // motor_lines[4..7] -> motor_pins[4..7]
         gpio_write(motor_pins[4], 0);
         gpio_write(motor_pins[5], 0);
         gpio_write(motor_pins[6], 1);
@@ -832,7 +1075,25 @@ static void dispense(int slot) {
     }
 }
 
-// ------------------- timer tick (time + auto reload + dispense checks) -------------------
+// ------------------- timer tick -------------------
+static gboolean schedule_file_changed(time_t *last_mtime_out) {
+    char path[512];
+    get_schedule_path(path, sizeof(path));
+
+    struct stat st;
+    if (stat(path, &st) != 0) return FALSE;
+
+    if (*last_mtime_out == 0) {
+        *last_mtime_out = st.st_mtime;
+        return FALSE;
+    }
+    if (st.st_mtime != *last_mtime_out) {
+        *last_mtime_out = st.st_mtime;
+        return TRUE;
+    }
+    return FALSE;
+}
+
 static gboolean tick_update_time(gpointer user_data) {
     App *app = (App *)user_data;
 
@@ -840,32 +1101,44 @@ static gboolean tick_update_time(gpointer user_data) {
     if (app->time_label_timepage) set_label_to_now(app->time_label_timepage);
     if (app->wifi_time_label)     set_label_to_now(app->wifi_time_label);
 
-    // Auto-reload schedule file if changed (e.g., edited via M5 web)
     static time_t last_mtime = 0;
     if (schedule_file_changed(&last_mtime)) {
         load_schedules(app);
-        update_main_schedule_labels(app);
+        rebuild_today_schedule(app);
         fill_schedule_spins_from_data(app);
     }
 
-    // Dispense check: only once per minute
+    static int last_dispense_hour = -1;
     static int last_dispense_minute = -1;
+    static int last_day = -1;
 
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
     if (!t) return TRUE;
 
-    if (t->tm_min == last_dispense_minute) return TRUE;
-    last_dispense_minute = t->tm_min;
-
-    // Linux tm_wday: Sun=0..Sat=6. Convert to Mon=0..Sun=6:
     int today = (t->tm_wday + 6) % 7;
 
-    if (t->tm_hour == app->slot1[today].h && t->tm_min == app->slot1[today].m) {
-        dispense(1);
+    if (today != last_day) {
+        rebuild_today_schedule(app);
+        last_day = today;
     }
-    if (t->tm_hour == app->slot2[today].h && t->tm_min == app->slot2[today].m) {
-        dispense(2);
+
+    if (t->tm_hour == last_dispense_hour && t->tm_min == last_dispense_minute) {
+        return TRUE;
+    }
+    last_dispense_hour = t->tm_hour;
+    last_dispense_minute = t->tm_min;
+
+    for (int i = 0; i < MAX_TIMES; i++) {
+        HM s1 = app->slot_times[today][0][i];
+        HM s2 = app->slot_times[today][1][i];
+
+        if (s1.enabled && s1.h == t->tm_hour && s1.m == t->tm_min) {
+            dispense(1);
+        }
+        if (s2.enabled && s2.h == t->tm_hour && s2.m == t->tm_min) {
+            dispense(2);
+        }
     }
 
     return TRUE;
@@ -900,33 +1173,17 @@ static GtkWidget *build_main_page(App *app) {
     gtk_label_set_xalign(GTK_LABEL(app->time_label_main), 0.0f);
     gtk_box_pack_start(GTK_BOX(root), app->time_label_main, FALSE, FALSE, 0);
 
-    GtkWidget *hdr = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(hdr), "<span size='x-large' weight='bold'>This Week’s Schedule</span>");
-    gtk_label_set_xalign(GTK_LABEL(hdr), 0.0f);
-    gtk_box_pack_start(GTK_BOX(root), hdr, FALSE, FALSE, 0);
+    app->today_sched_title = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(app->today_sched_title), "<span size='x-large' weight='bold'>Today's Schedule</span>");
+    gtk_label_set_xalign(GTK_LABEL(app->today_sched_title), 0.0f);
+    gtk_box_pack_start(GTK_BOX(root), app->today_sched_title, FALSE, FALSE, 0);
 
-    GtkWidget *grid = gtk_grid_new();
-    gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
-    gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
+    app->today_sched_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_box_pack_start(GTK_BOX(root), app->today_sched_box, FALSE, FALSE, 0);
 
-    gtk_grid_attach(GTK_GRID(grid), make_cell_label("Day", TRUE), 0, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), make_cell_label("Pill Slot 1", TRUE), 1, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), make_cell_label("Pill Slot 2", TRUE), 2, 0, 1, 1);
+    app->today_empty_label = gtk_label_new("No time slots set for today.");
+    gtk_label_set_xalign(GTK_LABEL(app->today_empty_label), 0.0f);
 
-    for (int i = 0; i < 7; i++) {
-        GtkWidget *lbl_day = make_cell_label(DAYS[i], FALSE);
-        GtkWidget *lbl_s1  = make_cell_label("--:--", FALSE);
-        GtkWidget *lbl_s2  = make_cell_label("--:--", FALSE);
-
-        app->main_sched_labels[i][0] = lbl_s1;
-        app->main_sched_labels[i][1] = lbl_s2;
-
-        gtk_grid_attach(GTK_GRID(grid), lbl_day, 0, i + 1, 1, 1);
-        gtk_grid_attach(GTK_GRID(grid), lbl_s1,  1, i + 1, 1, 1);
-        gtk_grid_attach(GTK_GRID(grid), lbl_s2,  2, i + 1, 1, 1);
-    }
-
-    gtk_box_pack_start(GTK_BOX(root), grid, FALSE, FALSE, 0);
     return root;
 }
 
@@ -979,6 +1236,61 @@ static GtkWidget *build_settings_page(App *app) {
     return root;
 }
 
+static GtkWidget *build_slot_editor(App *app, int day, int slot) {
+    GtkWidget *frame = gtk_frame_new(slot == 0 ? "Pill Slot 1" : "Pill Slot 2");
+    GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(outer), 8);
+    gtk_container_add(GTK_CONTAINER(frame), outer);
+
+    GtkWidget *controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *btn_add = gtk_button_new_with_label("+");
+    GtkWidget *btn_sub = gtk_button_new_with_label("-");
+
+    gtk_box_pack_start(GTK_BOX(controls), gtk_label_new("Time slots:"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(controls), btn_add, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(controls), btn_sub, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(outer), controls, FALSE, FALSE, 0);
+
+    DaySlotRef *ref_add = g_malloc(sizeof(DaySlotRef));
+    ref_add->app = app;
+    ref_add->day = day;
+    ref_add->slot = slot;
+
+    DaySlotRef *ref_sub = g_malloc(sizeof(DaySlotRef));
+    ref_sub->app = app;
+    ref_sub->day = day;
+    ref_sub->slot = slot;
+
+    g_signal_connect(btn_add, "clicked", G_CALLBACK(on_slot_add_clicked), ref_add);
+    g_signal_connect(btn_sub, "clicked", G_CALLBACK(on_slot_remove_clicked), ref_sub);
+
+    for (int i = 0; i < MAX_TIMES; i++) {
+        GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+
+        char idxbuf[16];
+        snprintf(idxbuf, sizeof(idxbuf), "%d.", i + 1);
+        GtkWidget *idx = gtk_label_new(idxbuf);
+        gtk_label_set_xalign(GTK_LABEL(idx), 0.0f);
+
+        GtkWidget *h = make_spin(0, 23, 1);
+        GtkWidget *m = make_spin(0, 59, 1);
+
+        app->sched_rows[day][slot][i] = row;
+        app->sched_spin[day][slot][i][0] = h;
+        app->sched_spin[day][slot][i][1] = m;
+
+        gtk_box_pack_start(GTK_BOX(row), idx, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(row), gtk_label_new("Hour"), FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(row), h, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(row), gtk_label_new("Min"), FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(row), m, FALSE, FALSE, 0);
+
+        gtk_box_pack_start(GTK_BOX(outer), row, FALSE, FALSE, 0);
+    }
+
+    return frame;
+}
+
 static GtkWidget *build_schedules_page(App *app) {
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
 
@@ -1000,33 +1312,30 @@ static GtkWidget *build_schedules_page(App *app) {
 
     gtk_box_pack_start(GTK_BOX(root), top, FALSE, FALSE, 0);
 
-    GtkWidget *grid = gtk_grid_new();
-    gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
-    gtk_grid_set_column_spacing(GTK_GRID(grid), 10);
-    gtk_box_pack_start(GTK_BOX(root), grid, FALSE, FALSE, 0);
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_vexpand(scroll, TRUE);
+    gtk_box_pack_start(GTK_BOX(root), scroll, TRUE, TRUE, 0);
 
-    gtk_grid_attach(GTK_GRID(grid), make_cell_label("Day", TRUE), 0, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), make_cell_label("Slot 1 (HH:MM)", TRUE), 1, 0, 2, 1);
-    gtk_grid_attach(GTK_GRID(grid), make_cell_label("Slot 2 (HH:MM)", TRUE), 3, 0, 2, 1);
+    GtkWidget *days_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_container_set_border_width(GTK_CONTAINER(days_box), 4);
+    gtk_container_add(GTK_CONTAINER(scroll), days_box);
 
     for (int d = 0; d < 7; d++) {
-        GtkWidget *lbl_day = make_cell_label(DAYS[d], FALSE);
+        GtkWidget *day_frame = gtk_frame_new(DAYS[d]);
+        GtkWidget *day_grid = gtk_grid_new();
+        gtk_container_set_border_width(GTK_CONTAINER(day_grid), 10);
+        gtk_grid_set_row_spacing(GTK_GRID(day_grid), 8);
+        gtk_grid_set_column_spacing(GTK_GRID(day_grid), 12);
+        gtk_container_add(GTK_CONTAINER(day_frame), day_grid);
 
-        GtkWidget *s1_h = make_spin(0, 23, 1);
-        GtkWidget *s1_m = make_spin(0, 59, 1);
-        GtkWidget *s2_h = make_spin(0, 23, 1);
-        GtkWidget *s2_m = make_spin(0, 59, 1);
+        GtkWidget *slot1 = build_slot_editor(app, d, 0);
+        GtkWidget *slot2 = build_slot_editor(app, d, 1);
 
-        app->sched_spin[d][0][0] = s1_h;
-        app->sched_spin[d][0][1] = s1_m;
-        app->sched_spin[d][1][0] = s2_h;
-        app->sched_spin[d][1][1] = s2_m;
+        gtk_grid_attach(GTK_GRID(day_grid), slot1, 0, 0, 1, 1);
+        gtk_grid_attach(GTK_GRID(day_grid), slot2, 1, 0, 1, 1);
 
-        gtk_grid_attach(GTK_GRID(grid), lbl_day, 0, d + 1, 1, 1);
-        gtk_grid_attach(GTK_GRID(grid), s1_h,   1, d + 1, 1, 1);
-        gtk_grid_attach(GTK_GRID(grid), s1_m,   2, d + 1, 1, 1);
-        gtk_grid_attach(GTK_GRID(grid), s2_h,   3, d + 1, 1, 1);
-        gtk_grid_attach(GTK_GRID(grid), s2_m,   4, d + 1, 1, 1);
+        gtk_box_pack_start(GTK_BOX(days_box), day_frame, FALSE, FALSE, 0);
     }
 
     app->sched_status_label = gtk_label_new("");
@@ -1224,7 +1533,7 @@ static GtkWidget *build_admin_extract_page(App *app) {
     return root;
 }
 
-// ------------------- MAIN -------------------
+// ------------------- main -------------------
 int main(int argc, char **argv) {
     App app;
     memset(&app, 0, sizeof(app));
@@ -1238,7 +1547,7 @@ int main(int argc, char **argv) {
 
     app.window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(app.window), "Auto Pill Dispenser");
-    gtk_window_set_default_size(GTK_WINDOW(app.window), 920, 560);
+    gtk_window_set_default_size(GTK_WINDOW(app.window), 980, 680);
     gtk_container_set_border_width(GTK_CONTAINER(app.window), 16);
     g_signal_connect(app.window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
 
@@ -1255,16 +1564,16 @@ int main(int argc, char **argv) {
     gtk_stack_add_named(GTK_STACK(app.stack), build_admin_extract_page(&app), "admin_extract");
 
     show_main(&app);
-    update_main_schedule_labels(&app);
+    rebuild_today_schedule(&app);
+    fill_schedule_spins_from_data(&app);
 
-    // Setup GPIO outputs via raspi-gpio
     gpio_setup_outputs();
 
     g_timeout_add(1000, tick_update_time, &app);
     tick_update_time(&app);
 
     gtk_widget_show_all(app.window);
+    refresh_all_schedule_visibility(&app);
     gtk_main();
     return 0;
 }
-
