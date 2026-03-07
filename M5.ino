@@ -4,18 +4,14 @@
 #include <HTTPClient.h>
 #include <time.h>
 
-// ================== WiFi settings ==================
 #define WIFI_SSID "Forsberg"
 #define WIFI_PASS "CommSucks"
 
-// ================== Buzzer settings ==================
 #define BUZZER_PIN 2
 
-// ================== Pi server settings ==================
-#define PI_HOST "172.20.10.10"   // <-- CHANGE THIS to Pi IP (or hostname)
+#define PI_HOST "172.20.10.10"
 #define PI_PORT 5050
 
-// ================== Time / NTP (Central Time) ==================
 const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = -6 * 3600;
 const int daylightOffset_sec = 3600;
@@ -24,7 +20,6 @@ WebServer server(80);
 bool wifiOk = false;
 bool timeOk = false;
 
-// Alarm state
 bool alarmSet = false;
 time_t alarmEpoch = 0;
 char alarmLabel[96] = {0};
@@ -32,9 +27,8 @@ char alarmLabel[96] = {0};
 bool buzzerReady = false;
 bool showingTime = false;
 unsigned long lastTimeUpdateMs = 0;
-
 unsigned long lastNextPollMs = 0;
-const unsigned long NEXT_POLL_INTERVAL_MS = 15000; // 15s
+const unsigned long NEXT_POLL_INTERVAL_MS = 15000;
 
 // ---------- Battery helpers ----------
 int getBatteryPercent() {
@@ -130,8 +124,7 @@ String piBaseUrl() {
 
 bool httpGetFromPi(const String& path, String& outBody, String& outCT) {
   HTTPClient http;
-  String url = piBaseUrl() + path;
-  http.begin(url);
+  http.begin(piBaseUrl() + path);
   int code = http.GET();
   if (code <= 0) { http.end(); return false; }
   outBody = http.getString();
@@ -142,8 +135,7 @@ bool httpGetFromPi(const String& path, String& outBody, String& outCT) {
 
 bool httpPostToPiText(const String& path, const String& bodyIn, String& outBody) {
   HTTPClient http;
-  String url = piBaseUrl() + path;
-  http.begin(url);
+  http.begin(piBaseUrl() + path);
   http.addHeader("Content-Type", "text/plain");
   int code = http.POST((uint8_t*)bodyIn.c_str(), bodyIn.length());
   if (code <= 0) { http.end(); return false; }
@@ -152,7 +144,6 @@ bool httpPostToPiText(const String& path, const String& bodyIn, String& outBody)
   return (code >= 200 && code < 300);
 }
 
-// Tiny JSON helpers for /api/next response
 long jsonGetLong(const String& body, const char* key) {
   String k = String("\"") + key + "\":";
   int idx = body.indexOf(k);
@@ -202,7 +193,6 @@ void refreshNextFromPi() {
   }
 }
 
-// ===== Web UI (hosted on M5, backed by Pi via proxy) =====
 void handleRoot() {
   String html = R"rawliteral(
 <!DOCTYPE html>
@@ -212,50 +202,151 @@ void handleRoot() {
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>APD Scheduler</title>
   <style>
-    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:linear-gradient(135deg,#0f172a,#1d4ed8);color:#e5e7eb;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:18px;}
-    .card{background:rgba(15,23,42,.92);border-radius:16px;padding:20px 18px;box-shadow:0 20px 40px rgba(0,0,0,.4);max-width:760px;width:100%;}
-    h1{margin:0 0 6px;font-size:1.3rem;}
-    .sub{color:#9ca3af;margin:0 0 16px;}
-    .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:12px;}
-    .pill{padding:6px 10px;border:1px solid rgba(255,255,255,.15);border-radius:999px;color:#a5b4fc;font-size:.9rem}
-    table{width:100%;border-collapse:collapse;margin-top:10px;}
-    th,td{border-bottom:1px solid rgba(255,255,255,.08);padding:10px 8px;text-align:left;}
-    th{color:#cbd5e1;font-weight:600;}
-    input{width:90px;padding:8px 10px;border-radius:10px;border:1px solid #4b5563;background:#020617;color:#e5e7eb;}
-    button{background:#6366f1;color:white;border:none;border-radius:999px;padding:9px 14px;font-size:.95rem;cursor:pointer}
-    button:hover{background:#4f46e5}
-    .status{margin-top:10px;color:#9ca3af;font-size:.9rem;white-space:pre-wrap}
-    .ok{color:#86efac}
-    .bad{color:#fca5a5}
+    :root{
+      --bg1:#0f172a;
+      --bg2:#1d4ed8;
+      --card:#0f172aee;
+      --muted:#94a3b8;
+      --line:rgba(255,255,255,.10);
+      --accent:#6366f1;
+      --accent2:#4f46e5;
+      --ok:#86efac;
+      --bad:#fca5a5;
+      --text:#e5e7eb;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+      background:linear-gradient(135deg,var(--bg1),var(--bg2));
+      color:var(--text);
+      min-height:100vh;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      padding:18px;
+    }
+    .card{
+      background:var(--card);
+      border-radius:18px;
+      padding:20px 18px;
+      box-shadow:0 20px 40px rgba(0,0,0,.4);
+      max-width:760px;
+      width:100%;
+    }
+    h1{margin:0 0 6px;font-size:1.35rem}
+    .sub{color:var(--muted);margin:0 0 16px}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px;}
+    .pill{
+      padding:6px 10px;
+      border:1px solid rgba(255,255,255,.15);
+      border-radius:999px;
+      color:#c7d2fe;
+      font-size:.9rem
+    }
+    button, select{
+      background:var(--accent);
+      color:white;
+      border:none;
+      border-radius:999px;
+      padding:9px 14px;
+      font-size:.95rem;
+      cursor:pointer
+    }
+    button:hover, select:hover{background:var(--accent2)}
+    .ghost{background:#1e293b}
+    .daybar{
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:10px;
+      margin:14px 0 10px;
+      flex-wrap:wrap;
+    }
+    .section{
+      border:1px solid var(--line);
+      border-radius:14px;
+      padding:14px;
+      margin-top:12px;
+      background:rgba(2,6,23,.45);
+    }
+    .section h2{margin:0 0 10px;font-size:1.05rem}
+    .slot-top{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      margin-bottom:10px;
+      flex-wrap:wrap;
+    }
+    .slot-controls{display:flex;gap:8px;align-items:center}
+    .time-row{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      margin-bottom:8px;
+      padding:8px 0;
+      border-bottom:1px solid rgba(255,255,255,.06);
+    }
+    .time-row:last-child{border-bottom:none}
+    .idx{width:24px;color:var(--muted);font-size:.9rem}
+    input[type="time"]{
+      padding:8px 10px;
+      border-radius:10px;
+      border:1px solid #475569;
+      background:#020617;
+      color:var(--text);
+      width:140px;
+    }
+    .empty{color:var(--muted);font-size:.95rem;padding:4px 0}
+    .status{margin-top:10px;color:var(--muted);font-size:.9rem;white-space:pre-wrap}
+    .ok{color:var(--ok)}
+    .bad{color:var(--bad)}
   </style>
 </head>
 <body>
   <div class="card">
-    <h1>APD Scheduler (Synced)</h1>
-    <p class="sub">This page is hosted on the M5, but schedules are stored on the Raspberry Pi.</p>
+    <h1>APD Scheduler</h1>
+    <p class="sub">Hosted on the M5. Schedules are synced with the Raspberry Pi.</p>
 
     <div class="row">
       <div class="pill">M5: <span id="m5"></span></div>
-      <div class="pill">Pi: PI_HOST:PI_PORT</div>
+      <div class="pill">Pi: __PI_HOST__:__PI_PORT__</div>
       <button onclick="loadSched()">Refresh</button>
       <button onclick="saveSched()">Save</button>
     </div>
 
     <div class="row">
       <div class="pill">Next dispense: <span id="nextdisp">(loading)</span></div>
-      <button onclick="refreshNext()">Refresh Next</button>
+      <button class="ghost" onclick="refreshNext()">Refresh Next</button>
     </div>
 
-    <table>
-      <thead><tr><th>Day</th><th>Slot 1</th><th>Slot 2</th></tr></thead>
-      <tbody id="tbody"></tbody>
-    </table>
+    <div class="daybar">
+      <div class="pill">Editing day: <span id="currentDayLabel"></span></div>
+      <select id="daySelect" onchange="renderDay()"></select>
+    </div>
 
+    <div id="dayContainer"></div>
     <div id="status" class="status"></div>
   </div>
 
 <script>
 const DAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+const MAX_TIMES = 10;
+
+function blankEntry(defTime){
+  return { enabled: 0, time: defTime };
+}
+
+function blankDay(day){
+  return {
+    day,
+    slot1: Array.from({length: MAX_TIMES}, () => blankEntry("08:00")),
+    slot2: Array.from({length: MAX_TIMES}, () => blankEntry("20:00"))
+  };
+}
+
+let scheduleData = DAYS.map(d => blankDay(d));
 
 function setStatus(msg, ok=true){
   const el = document.getElementById("status");
@@ -263,39 +354,189 @@ function setStatus(msg, ok=true){
   el.className = "status " + (ok ? "ok" : "bad");
 }
 
-function buildTableFromText(txt){
-  const map = {};
-  for(const d of DAYS) map[d] = {slot1:"08:00", slot2:"20:00"};
-  const lines = (txt||"").split("\n").map(l=>l.trim()).filter(Boolean);
+function getTodayDayName(){
+  const jsDay = new Date().getDay();
+  const map = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+  return map[jsDay];
+}
+
+function ensureDaySelect(){
+  const sel = document.getElementById("daySelect");
+  sel.innerHTML = "";
+  for(const d of DAYS){
+    const opt = document.createElement("option");
+    opt.value = d;
+    opt.textContent = d;
+    sel.appendChild(opt);
+  }
+  const today = getTodayDayName();
+  sel.value = DAYS.includes(today) ? today : "Mon";
+  document.getElementById("currentDayLabel").textContent = sel.value;
+}
+
+function parseScheduleText(txt){
+  const out = DAYS.map(d => blankDay(d));
+  const lines = (txt || "").split("\n").map(x => x.trim()).filter(Boolean);
+
   for(const line of lines){
     const parts = line.split(/\s+/);
-    if(parts.length >= 3 && map[parts[0]]){
-      map[parts[0]].slot1 = parts[1];
-      map[parts[0]].slot2 = parts[2];
+    if(parts.length < 22) continue;
+
+    const day = parts[0];
+    const obj = out.find(x => x.day === day);
+    if(!obj) continue;
+
+    let idx = 1;
+    for(let i = 0; i < MAX_TIMES; i++){
+      const p = parts[idx++];
+      if(!p) break;
+      const m = p.match(/^(\d):(\d{2}):(\d{2})$/);
+      if(m){
+        obj.slot1[i].enabled = parseInt(m[1], 10) ? 1 : 0;
+        obj.slot1[i].time = `${m[2]}:${m[3]}`;
+      }
+    }
+
+    if(parts[idx] === "|") idx++;
+
+    for(let i = 0; i < MAX_TIMES; i++){
+      const p = parts[idx++];
+      if(!p) break;
+      const m = p.match(/^(\d):(\d{2}):(\d{2})$/);
+      if(m){
+        obj.slot2[i].enabled = parseInt(m[1], 10) ? 1 : 0;
+        obj.slot2[i].time = `${m[2]}:${m[3]}`;
+      }
     }
   }
 
-  const tb = document.getElementById("tbody");
-  tb.innerHTML = "";
-  for(const d of DAYS){
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>${d}</td>
-      <td><input id="${d}_s1" value="${map[d].slot1}" /></td>
-      <td><input id="${d}_s2" value="${map[d].slot2}" /></td>
-    `;
-    tb.appendChild(tr);
-  }
+  return out;
 }
 
-function tableToText(){
+function scheduleToText(){
   let out = "";
-  for(const d of DAYS){
-    const s1 = document.getElementById(`${d}_s1`).value.trim();
-    const s2 = document.getElementById(`${d}_s2`).value.trim();
-    out += `${d} ${s1} ${s2}\n`;
+  for(const d of scheduleData){
+    out += d.day + " ";
+    for(let i = 0; i < MAX_TIMES; i++){
+      const e = d.slot1[i];
+      out += `${e.enabled ? 1 : 0}:${e.time} `;
+    }
+    out += "| ";
+    for(let i = 0; i < MAX_TIMES; i++){
+      const e = d.slot2[i];
+      out += `${e.enabled ? 1 : 0}:${e.time} `;
+    }
+    out += "\n";
   }
   return out;
+}
+
+function activeCount(arr){
+  return arr.filter(x => x.enabled).length;
+}
+
+function visibleCount(arr){
+  return activeCount(arr);
+}
+
+function sortSlot(arr, defTime){
+  const enabled = arr
+    .filter(x => x.enabled)
+    .sort((a,b) => {
+      const am = parseInt(a.time.slice(0,2),10) * 60 + parseInt(a.time.slice(3,5),10);
+      const bm = parseInt(b.time.slice(0,2),10) * 60 + parseInt(b.time.slice(3,5),10);
+      return am - bm;
+    });
+
+  const disabled = Array.from({length: MAX_TIMES - enabled.length}, () => blankEntry(defTime));
+  return [...enabled, ...disabled];
+}
+
+function getCurrentDayObj(){
+  const sel = document.getElementById("daySelect").value;
+  return scheduleData.find(x => x.day === sel);
+}
+
+function addRow(slotName){
+  const day = getCurrentDayObj();
+  const arr = day[slotName];
+  const count = activeCount(arr);
+  if(count >= MAX_TIMES) return;
+
+  const defTime = (slotName === "slot1") ? "08:00" : "20:00";
+  arr[count].enabled = 1;
+  if(!arr[count].time) arr[count].time = defTime;
+
+  renderDay();
+}
+
+function removeRow(slotName){
+  const day = getCurrentDayObj();
+  const arr = day[slotName];
+  const count = activeCount(arr);
+  if(count <= 0){
+    renderDay();
+    return;
+  }
+
+  arr[count - 1].enabled = 0;
+
+  const defTime = (slotName === "slot1") ? "08:00" : "20:00";
+  day[slotName] = sortSlot(arr, defTime);
+
+  renderDay();
+}
+
+function updateTime(slotName, index, value){
+  const day = getCurrentDayObj();
+  day[slotName][index].time = value;
+  day[slotName][index].enabled = 1;
+}
+
+function renderSlot(title, slotName){
+  const day = getCurrentDayObj();
+  const defTime = (slotName === "slot1") ? "08:00" : "20:00";
+  day[slotName] = sortSlot(day[slotName], defTime);
+
+  const arr = day[slotName];
+  const vis = visibleCount(arr);
+  const active = activeCount(arr);
+
+  let rows = "";
+  if(active === 0){
+    rows = `<div class="empty">No time slots set</div>`;
+  } else {
+    for(let i = 0; i < vis; i++){
+      const t = arr[i].time || defTime;
+      rows += `
+        <div class="time-row">
+          <div class="idx">${i + 1}.</div>
+          <input type="time" value="${t}" onchange="updateTime('${slotName}', ${i}, this.value)" />
+        </div>
+      `;
+    }
+  }
+
+  return `
+    <div class="section">
+      <div class="slot-top">
+        <h2>${title}</h2>
+        <div class="slot-controls">
+          <button class="ghost" onclick="removeRow('${slotName}')">-</button>
+          <button onclick="addRow('${slotName}')">+</button>
+        </div>
+      </div>
+      ${rows}
+    </div>
+  `;
+}
+
+function renderDay(){
+  const sel = document.getElementById("daySelect").value;
+  document.getElementById("currentDayLabel").textContent = sel;
+  document.getElementById("dayContainer").innerHTML =
+    renderSlot("Pill Slot 1", "slot1") +
+    renderSlot("Pill Slot 2", "slot2");
 }
 
 async function loadSched(){
@@ -304,7 +545,8 @@ async function loadSched(){
     const r = await fetch("/api/schedule");
     const t = await r.text();
     if(!r.ok) throw new Error(t || "Failed");
-    buildTableFromText(t);
+    scheduleData = parseScheduleText(t);
+    renderDay();
     setStatus("Loaded schedule.", true);
   }catch(e){
     setStatus("Load failed: " + e.message, false);
@@ -314,7 +556,7 @@ async function loadSched(){
 async function saveSched(){
   setStatus("Saving schedule to Pi...");
   try{
-    const body = tableToText();
+    const body = scheduleToText();
     const r = await fetch("/api/schedule", {
       method:"POST",
       headers:{"Content-Type":"text/plain"},
@@ -344,6 +586,8 @@ async function refreshNext(){
 }
 
 document.getElementById("m5").textContent = location.host;
+ensureDaySelect();
+renderDay();
 loadSched();
 refreshNext();
 </script>
@@ -351,13 +595,12 @@ refreshNext();
 </html>
 )rawliteral";
 
-  html.replace("PI_HOST", String(PI_HOST));
-  html.replace("PI_PORT", String(PI_PORT));
+  html.replace("__PI_HOST__", String(PI_HOST));
+  html.replace("__PI_PORT__", String(PI_PORT));
 
   server.send(200, "text/html", html);
 }
 
-// ---- Proxy routes (browser talks to M5, M5 talks to Pi) ----
 void handleApiScheduleGet() {
   String body, ct;
   if (!httpGetFromPi("/api/schedule", body, ct)) {
@@ -372,12 +615,14 @@ void handleApiSchedulePost() {
     server.send(400, "text/plain", "Missing body\n");
     return;
   }
+
   String in = server.arg("plain");
   String out;
   if (!httpPostToPiText("/api/schedule", in, out)) {
     server.send(502, "text/plain", "Pi write failed\n");
     return;
   }
+
   server.send(200, "text/plain", out);
   refreshNextFromPi();
 }
@@ -391,7 +636,6 @@ void handleApiNext() {
   server.send(200, "application/json", body);
 }
 
-// ========== WiFi + NTP setup ==========
 void setupWiFiAndTime() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -400,15 +644,12 @@ void setupWiFiAndTime() {
   M5.Lcd.setCursor(5, 5);
   M5.Lcd.setTextSize(2);
   M5.Lcd.println("Connecting...");
-  Serial.print("Connecting to WiFi");
 
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
     delay(300);
-    Serial.print(".");
     M5.Lcd.print(".");
   }
-  Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
     wifiOk = true;
@@ -505,4 +746,3 @@ void loop() {
     }
   }
 }
-
