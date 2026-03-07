@@ -1,9 +1,15 @@
 // schedule_server.c - Tiny HTTP server in C for APD schedules
 // Endpoints:
-//   GET  /api/schedule   -> text/plain schedule file (7 lines)
+//   GET  /api/schedule   -> text/plain schedule file
 //   POST /api/schedule   -> text/plain schedule file contents to save
 //   GET  /api/next       -> application/json {"ok":true,"next_epoch":...,"next_label":"..."}
 //   GET  /api/ping       -> application/json {"ok":true,"msg":"pong"}
+//
+// NEW FORMAT PER DAY:
+// Mon 1:08:00 0:08:00 0:08:00 0:08:00 0:08:00 0:08:00 0:08:00 0:08:00 0:08:00 0:08:00 | 1:20:00 0:20:00 0:20:00 0:20:00 0:20:00 0:20:00 0:20:00 0:20:00 0:20:00 0:20:00
+//
+// Each token is:
+// enabled:HH:MM
 //
 // Build:
 //   gcc -O2 -Wall -Wextra -std=gnu99 schedule_server.c -o schedule_server
@@ -31,8 +37,15 @@
 #define MAX_REQ (64 * 1024)
 #define MAX_BODY (64 * 1024)
 #define SCHEDULE_FILE ".pill_dispenser_schedule.txt"
+#define MAX_TIMES 10
 
 static const char *DAYS[7] = {"Mon","Tue","Wed","Thu","Fri","Sat","Sun"};
+
+typedef struct {
+    int enabled;
+    int h;
+    int m;
+} TimeEntry;
 
 static void trim(char *s) {
     size_t n = strlen(s);
@@ -48,16 +61,22 @@ static void get_schedule_path(char *out, size_t outsz) {
     snprintf(out, outsz, "%s/%s", home, SCHEDULE_FILE);
 }
 
-static bool valid_hhmm(const char *s) {
-    if (!s) return false;
-    if (!isdigit((unsigned char)s[0]) || !isdigit((unsigned char)s[1])) return false;
-    if (s[2] != ':') return false;
-    if (!isdigit((unsigned char)s[3]) || !isdigit((unsigned char)s[4])) return false;
-    if (s[5] != '\0' && !isspace((unsigned char)s[5])) return false;
-
-    int hh = (s[0]-'0')*10 + (s[1]-'0');
-    int mm = (s[3]-'0')*10 + (s[4]-'0');
+static bool valid_hhmm_parts(int hh, int mm) {
     return (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59);
+}
+
+static bool parse_enabled_hhmm(const char *tok, int *enabled, int *hh, int *mm) {
+    if (!tok || !enabled || !hh || !mm) return false;
+
+    int en = -1, h = -1, m = -1;
+    if (sscanf(tok, "%d:%d:%d", &en, &h, &m) != 3) return false;
+    if (!(en == 0 || en == 1)) return false;
+    if (!valid_hhmm_parts(h, m)) return false;
+
+    *enabled = en;
+    *hh = h;
+    *mm = m;
+    return true;
 }
 
 static void ensure_default_schedule_file(void) {
@@ -69,16 +88,32 @@ static void ensure_default_schedule_file(void) {
 
     FILE *f = fopen(path, "w");
     if (!f) return;
-    for (int i=0;i<7;i++) {
-        fprintf(f, "%s 08:00 20:00\n", DAYS[i]);
+
+    for (int d = 0; d < 7; d++) {
+        fprintf(f, "%s ", DAYS[d]);
+
+        for (int i = 0; i < MAX_TIMES; i++) {
+            if (i == 0) fprintf(f, "1:08:00 ");
+            else        fprintf(f, "0:08:00 ");
+        }
+
+        fprintf(f, "| ");
+
+        for (int i = 0; i < MAX_TIMES; i++) {
+            if (i == 0) fprintf(f, "1:20:00 ");
+            else        fprintf(f, "0:20:00 ");
+        }
+
+        fprintf(f, "\n");
     }
+
     fclose(f);
 }
 
 static bool read_file_to_buf(const char *path, char *buf, size_t bufsz) {
     FILE *f = fopen(path, "r");
     if (!f) return false;
-    size_t n = fread(buf, 1, bufsz-1, f);
+    size_t n = fread(buf, 1, bufsz - 1, f);
     buf[n] = 0;
     fclose(f);
     return true;
@@ -91,18 +126,64 @@ static bool write_buf_to_file_atomic(const char *path, const char *buf) {
     FILE *f = fopen(tmp, "w");
     if (!f) return false;
     fputs(buf, f);
-    if (ferror(f)) { fclose(f); unlink(tmp); return false; }
+    if (ferror(f)) {
+        fclose(f);
+        unlink(tmp);
+        return false;
+    }
     fclose(f);
 
-    if (rename(tmp, path) != 0) { unlink(tmp); return false; }
+    if (rename(tmp, path) != 0) {
+        unlink(tmp);
+        return false;
+    }
+    return true;
+}
+
+static int day_index_from_name(const char *day) {
+    for (int i = 0; i < 7; i++) {
+        if (strcmp(day, DAYS[i]) == 0) return i;
+    }
+    return -1;
+}
+
+static bool validate_schedule_line(const char *line_in) {
+    char line[2048];
+    strncpy(line, line_in, sizeof(line) - 1);
+    line[sizeof(line) - 1] = 0;
+    trim(line);
+    if (!line[0]) return false;
+
+    char *saveptr = NULL;
+    char *tok = strtok_r(line, " \t", &saveptr);
+    if (!tok) return false;
+
+    if (day_index_from_name(tok) < 0) return false;
+
+    for (int slot = 0; slot < 2; slot++) {
+        for (int i = 0; i < MAX_TIMES; i++) {
+            tok = strtok_r(NULL, " \t", &saveptr);
+            if (!tok) return false;
+
+            if (slot == 1 && i == 0 && strcmp(tok, "|") == 0) {
+                tok = strtok_r(NULL, " \t", &saveptr);
+                if (!tok) return false;
+            }
+
+            int en, hh, mm;
+            if (!parse_enabled_hhmm(tok, &en, &hh, &mm)) return false;
+        }
+
+        if (slot == 0) {
+            tok = strtok_r(NULL, " \t", &saveptr);
+            if (!tok || strcmp(tok, "|") != 0) return false;
+        }
+    }
+
     return true;
 }
 
 static bool validate_schedule_text(const char *body) {
-    // Must contain at least 7 valid day lines:
-    // Mon HH:MM HH:MM
-    // ...
-    // We accept extra whitespace.
     int seen[7] = {0};
 
     char *copy = strdup(body ? body : "");
@@ -110,21 +191,19 @@ static bool validate_schedule_text(const char *body) {
 
     char *saveptr = NULL;
     char *line = strtok_r(copy, "\n", &saveptr);
+
     while (line) {
         trim(line);
-        if (!line[0]) { line = strtok_r(NULL, "\n", &saveptr); continue; }
+        if (!line[0]) {
+            line = strtok_r(NULL, "\n", &saveptr);
+            continue;
+        }
 
-        char day[16]={0}, t1[16]={0}, t2[16]={0};
-        if (sscanf(line, "%15s %15s %15s", day, t1, t2) == 3) {
-            for (int i=0;i<7;i++) {
-                if (strcmp(day, DAYS[i])==0) {
-                    // ensure tokens are exactly HH:MM
-                    t1[5]=0; t2[5]=0;
-                    if (strlen(t1)==5 && strlen(t2)==5 && valid_hhmm(t1) && valid_hhmm(t2)) {
-                        seen[i] = 1;
-                    }
-                    break;
-                }
+        char day[16] = {0};
+        if (sscanf(line, "%15s", day) == 1) {
+            int d = day_index_from_name(day);
+            if (d >= 0 && validate_schedule_line(line)) {
+                seen[d] = 1;
             }
         }
 
@@ -133,73 +212,115 @@ static bool validate_schedule_text(const char *body) {
 
     free(copy);
 
-    for (int i=0;i<7;i++) if (!seen[i]) return false;
+    for (int i = 0; i < 7; i++) {
+        if (!seen[i]) return false;
+    }
     return true;
 }
 
 static void compute_next_event(const char *sched_text, long *out_epoch, char *out_label, size_t out_label_sz) {
-    // Parse schedule into arrays [7][2]
-    int hh[7][2], mm[7][2];
-    for (int d=0; d<7; d++) { hh[d][0]=8; mm[d][0]=0; hh[d][1]=20; mm[d][1]=0; }
+    TimeEntry sched[7][2][MAX_TIMES];
+
+    for (int d = 0; d < 7; d++) {
+        for (int s = 0; s < 2; s++) {
+            for (int i = 0; i < MAX_TIMES; i++) {
+                sched[d][s][i].enabled = 0;
+                sched[d][s][i].h = 8;
+                sched[d][s][i].m = 0;
+            }
+        }
+        sched[d][0][0].enabled = 1;
+        sched[d][0][0].h = 8;
+        sched[d][0][0].m = 0;
+
+        sched[d][1][0].enabled = 1;
+        sched[d][1][0].h = 20;
+        sched[d][1][0].m = 0;
+    }
 
     char *copy = strdup(sched_text ? sched_text : "");
     if (copy) {
-        char *saveptr=NULL;
-        char *line=strtok_r(copy, "\n", &saveptr);
-        while (line) {
-            trim(line);
-            if (!line[0]) { line=strtok_r(NULL,"\n",&saveptr); continue; }
+        char *save_lines = NULL;
+        char *line = strtok_r(copy, "\n", &save_lines);
 
-            char day[16]={0}, t1[16]={0}, t2[16]={0};
-            if (sscanf(line, "%15s %15s %15s", day, t1, t2) == 3) {
-                for (int d=0; d<7; d++) {
-                    if (strcmp(day, DAYS[d])==0) {
-                        if (strlen(t1)>=5 && strlen(t2)>=5) {
-                            t1[5]=0; t2[5]=0;
-                            if (valid_hhmm(t1) && valid_hhmm(t2)) {
-                                hh[d][0] = (t1[0]-'0')*10 + (t1[1]-'0');
-                                mm[d][0] = (t1[3]-'0')*10 + (t1[4]-'0');
-                                hh[d][1] = (t2[0]-'0')*10 + (t2[1]-'0');
-                                mm[d][1] = (t2[3]-'0')*10 + (t2[4]-'0');
+        while (line) {
+            char linebuf[2048];
+            strncpy(linebuf, line, sizeof(linebuf) - 1);
+            linebuf[sizeof(linebuf) - 1] = 0;
+            trim(linebuf);
+
+            if (linebuf[0]) {
+                char *save_tok = NULL;
+                char *tok = strtok_r(linebuf, " \t", &save_tok);
+                if (tok) {
+                    int d = day_index_from_name(tok);
+                    if (d >= 0) {
+                        for (int s = 0; s < 2; s++) {
+                            for (int i = 0; i < MAX_TIMES; i++) {
+                                tok = strtok_r(NULL, " \t", &save_tok);
+                                if (!tok) break;
+
+                                if (s == 1 && i == 0 && strcmp(tok, "|") == 0) {
+                                    tok = strtok_r(NULL, " \t", &save_tok);
+                                    if (!tok) break;
+                                }
+
+                                int en, hh, mm;
+                                if (parse_enabled_hhmm(tok, &en, &hh, &mm)) {
+                                    sched[d][s][i].enabled = en;
+                                    sched[d][s][i].h = hh;
+                                    sched[d][s][i].m = mm;
+                                }
+                            }
+                            if (s == 0) {
+                                tok = strtok_r(NULL, " \t", &save_tok);
+                                if (!tok || strcmp(tok, "|") != 0) {
+                                    break;
+                                }
                             }
                         }
-                        break;
                     }
                 }
             }
-            line=strtok_r(NULL,"\n",&saveptr);
+
+            line = strtok_r(NULL, "\n", &save_lines);
         }
+
         free(copy);
     }
 
     time_t now = time(NULL);
     struct tm now_tm;
     localtime_r(&now, &now_tm);
-    long best = -1;
-    char best_label[128]={0};
 
-    // Linux tm_wday: Sun=0..Sat=6. Convert to Mon=0..Sun=6
+    long best = -1;
+    char best_label[128] = {0};
+
     int today_mon0 = (now_tm.tm_wday + 6) % 7;
 
-    for (int day_off=0; day_off<8; day_off++) {
+    for (int day_off = 0; day_off < 8; day_off++) {
         int d = (today_mon0 + day_off) % 7;
 
-        for (int slot=0; slot<2; slot++) {
-            // Start from "now" + day_off days, then set HH:MM:00
-            time_t base = now + (time_t)day_off * 24 * 3600;
-            struct tm cand;
-            localtime_r(&base, &cand);
-            cand.tm_hour = hh[d][slot];
-            cand.tm_min  = mm[d][slot];
-            cand.tm_sec  = 0;
+        for (int slot = 0; slot < 2; slot++) {
+            for (int i = 0; i < MAX_TIMES; i++) {
+                if (!sched[d][slot][i].enabled) continue;
 
-            time_t cand_epoch = mktime(&cand);
-            if (cand_epoch <= now) continue;
+                time_t base = now + (time_t)day_off * 24 * 3600;
+                struct tm cand;
+                localtime_r(&base, &cand);
+                cand.tm_hour = sched[d][slot][i].h;
+                cand.tm_min  = sched[d][slot][i].m;
+                cand.tm_sec  = 0;
 
-            if (best < 0 || cand_epoch < best) {
-                best = (long)cand_epoch;
-                snprintf(best_label, sizeof(best_label), "%s slot%d %02d:%02d",
-                         DAYS[d], slot+1, hh[d][slot], mm[d][slot]);
+                time_t cand_epoch = mktime(&cand);
+                if (cand_epoch <= now) continue;
+
+                if (best < 0 || cand_epoch < best) {
+                    best = (long)cand_epoch;
+                    snprintf(best_label, sizeof(best_label),
+                             "%s slot%d %02d:%02d",
+                             DAYS[d], slot + 1, sched[d][slot][i].h, sched[d][slot][i].m);
+                }
             }
         }
     }
@@ -213,13 +334,14 @@ static void compute_next_event(const char *sched_text, long *out_epoch, char *ou
 static void send_http(int fd, int code, const char *ctype, const char *body) {
     if (!ctype) ctype = "text/plain";
     if (!body) body = "";
+
     char header[512];
     int blen = (int)strlen(body);
-    const char *msg = (code==200) ? "OK" :
-                      (code==400) ? "Bad Request" :
-                      (code==404) ? "Not Found" :
-                      (code==500) ? "Internal Server Error" :
-                      (code==502) ? "Bad Gateway" : "OK";
+    const char *msg = (code == 200) ? "OK" :
+                      (code == 400) ? "Bad Request" :
+                      (code == 404) ? "Not Found" :
+                      (code == 500) ? "Internal Server Error" :
+                      (code == 502) ? "Bad Gateway" : "OK";
 
     int n = snprintf(header, sizeof(header),
         "HTTP/1.1 %d %s\r\n"
@@ -247,28 +369,26 @@ static int parse_content_length(const char *req) {
 
 static void handle_client(int cfd) {
     char req[MAX_REQ];
-    int r = (int)read(cfd, req, sizeof(req)-1);
+    int r = (int)read(cfd, req, sizeof(req) - 1);
     if (r <= 0) return;
     req[r] = 0;
 
-    // Find request line
-    char method[8]={0}, path[256]={0};
+    char method[8] = {0}, path[256] = {0};
     if (sscanf(req, "%7s %255s", method, path) != 2) {
         send_http(cfd, 400, "text/plain", "bad request\n");
         return;
     }
 
-    // Body (if any)
     const char *body_ptr = strstr(req, "\r\n\r\n");
     int content_len = parse_content_length(req);
     char body[MAX_BODY];
-    body[0]=0;
+    body[0] = 0;
 
     if (body_ptr) {
         body_ptr += 4;
         int already = r - (int)(body_ptr - req);
         if (content_len > 0) {
-            if (content_len >= (int)sizeof(body)) content_len = (int)sizeof(body)-1;
+            if (content_len >= (int)sizeof(body)) content_len = (int)sizeof(body) - 1;
             int tocopy = already < content_len ? already : content_len;
             if (tocopy > 0) memcpy(body, body_ptr, (size_t)tocopy);
 
@@ -283,11 +403,12 @@ static void handle_client(int cfd) {
     }
 
     ensure_default_schedule_file();
+
     char sched_path[512];
     get_schedule_path(sched_path, sizeof(sched_path));
 
-    if (strcmp(method, "GET")==0 && strcmp(path, "/api/schedule")==0) {
-        char filebuf[4096];
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/schedule") == 0) {
+        char filebuf[16384];
         if (!read_file_to_buf(sched_path, filebuf, sizeof(filebuf))) {
             send_http(cfd, 500, "text/plain", "failed to read schedule\n");
             return;
@@ -296,13 +417,16 @@ static void handle_client(int cfd) {
         return;
     }
 
-    if (strcmp(method, "POST")==0 && strcmp(path, "/api/schedule")==0) {
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/schedule") == 0) {
         if (!body[0]) {
             send_http(cfd, 400, "text/plain", "missing body\n");
             return;
         }
         if (!validate_schedule_text(body)) {
-            send_http(cfd, 400, "text/plain", "invalid schedule format\nexpected 7 lines like: Mon 08:00 20:00\n");
+            send_http(cfd, 400, "text/plain",
+                      "invalid schedule format\n"
+                      "expected 7 lines like:\n"
+                      "Mon 1:08:00 0:08:00 ... | 1:20:00 0:20:00 ...\n");
             return;
         }
         if (!write_buf_to_file_atomic(sched_path, body)) {
@@ -313,14 +437,15 @@ static void handle_client(int cfd) {
         return;
     }
 
-    if (strcmp(method, "GET")==0 && strcmp(path, "/api/next")==0) {
-        char filebuf[4096];
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/next") == 0) {
+        char filebuf[16384];
         if (!read_file_to_buf(sched_path, filebuf, sizeof(filebuf))) {
             send_http(cfd, 500, "application/json", "{\"ok\":false,\"error\":\"read failed\"}");
             return;
         }
-        long next_epoch=-1;
-        char label[128]={0};
+
+        long next_epoch = -1;
+        char label[128] = {0};
         compute_next_event(filebuf, &next_epoch, label, sizeof(label));
 
         char out[512];
@@ -331,7 +456,7 @@ static void handle_client(int cfd) {
         return;
     }
 
-    if (strcmp(method, "GET")==0 && strcmp(path, "/api/ping")==0) {
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/ping") == 0) {
         send_http(cfd, 200, "application/json", "{\"ok\":true,\"msg\":\"pong\"}");
         return;
     }
@@ -360,6 +485,7 @@ int main(void) {
         close(sfd);
         return 1;
     }
+
     if (listen(sfd, 16) != 0) {
         perror("listen");
         close(sfd);
@@ -384,4 +510,3 @@ int main(void) {
     close(sfd);
     return 0;
 }
-
