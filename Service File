@@ -1,0 +1,13 @@
+#!/bin/bash
+export DISPLAY=:0
+export XAUTHORITY=/home/autopilldispense/.Xauthority
+export HOME=/home/autopilldispense
+
+sleep 5
+
+for i in $(seq 1 20); do
+    xdpyinfo >/dev/null 2>&1 && break
+    sleep 1
+done
+
+/home/autopilldispense/Desktop/pill_ui
