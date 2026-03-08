@@ -493,20 +493,39 @@ static void on_power_clicked(GtkWidget *w, gpointer user_data) {
         GTK_BUTTONS_OK_CANCEL,
         "Shut down the Raspberry Pi now?"
     );
-    gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dlg),
-        "This will power off the device. You will need to turn it back on manually.");
+    gtk_message_dialog_format_secondary_text(
+        GTK_MESSAGE_DIALOG(dlg),
+        "This will power off the device. You will need to turn it back on manually."
+    );
 
     int resp = gtk_dialog_run(GTK_DIALOG(dlg));
     gtk_widget_destroy(dlg);
 
-    if (resp == GTK_RESPONSE_OK) {
-        system("pkexec /usr/sbin/shutdown -h now");
-    }
-}
+    if (resp != GTK_RESPONSE_OK) return;
 
+    // Keep prompting for auth until it succeeds
+    while (1) {
+        int auth = pkexec_auth_ping();
+
+        if (auth == 0) {
+            break;
+        }
+    }
+
+    // After successful auth, power off
+    system("pkexec /usr/bin/systemctl poweroff");
+}
 static void on_dev_edit_clicked(GtkWidget *w, gpointer user_data) {
     (void)w;
-    (void)user_data;
+    App *app = (App *)user_data;
+
+    // Exit fullscreen if active
+    gtk_window_unfullscreen(GTK_WINDOW(app->window));
+
+    // Minimize the UI window
+    gtk_window_iconify(GTK_WINDOW(app->window));
+
+    // Open the source code editor
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "geany %s &", DEV_FILE_PATH);
     system(cmd);
@@ -1548,6 +1567,7 @@ int main(int argc, char **argv) {
     app.window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(app.window), "Auto Pill Dispenser");
     gtk_window_set_default_size(GTK_WINDOW(app.window), 980, 680);
+    gtk_window_fullscreen(GTK_WINDOW(app.window)); 
     gtk_container_set_border_width(GTK_CONTAINER(app.window), 16);
     g_signal_connect(app.window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
 
