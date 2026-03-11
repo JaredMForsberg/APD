@@ -1,18 +1,13 @@
-// pill_ui.c  (NO KEYPAD VERSION)  — NO libgpiod (uses raspi-gpio)
+// pill_ui.c  (Basic KEYPAD VERSION)  — NO libgpiod (uses raspi-gpio)
 // GTK3 UI + schedules + time/date + wifi + dev edit + power shutdown
 // + Admin Reset (reset schedules + clear admin.txt)
 // + Admin Extract (copy admin log to selected USB drive)
 // + Admin Extract is gated by Pi user's password via pkexec (no separate admin password)
 //
-// UPDATED CLEANER VERSION:
-// - Main screen shows ONLY today's schedule
-// - Only active time slots are shown on main screen
-// - If no times are set today, main screen shows: "No time slots set for today."
-// - Each day supports up to 10 dispense times for Slot 1
-// - Each day supports up to 10 dispense times for Slot 2
-// - Scheduler page has + / - buttons for each day + slot to add/remove visible time rows
-// - Uses enabled flags internally so empty rows stay hidden/unused
-// - Default for every day/slot is now 0 visible rows
+// UPDATES:
+// functions added for basic Keypad functionallity, polling, focusing on specific widgets,
+// ui navigation on main pages should work though it's is clunky and will need revisions
+// use 4 as left and 6 as right, all widgets are treated as an array so keep clicking
 //
 // Compile:
 //   gcc -std=gnu99 -O2 -Wall -Wextra /home/autopilldispense/Desktop/pill_ui.c -o /home/autopilldispense/Desktop/pill_ui $(pkg-config --cflags --libs gtk+-3.0)
