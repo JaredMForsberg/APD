@@ -34,9 +34,19 @@
 #define SCHEDULE_FILE   ".pill_dispenser_schedule.txt"
 #define ADMIN_LOG_PATH  "/home/autopilldispense/Desktop/admin.txt"
 #define MAX_TIMES       10
+#define MAX_FOCUS_WIDGETS 310
 
 static const char *DAYS[7] = {"Mon","Tue","Wed","Thu","Fri","Sat","Sun"};
 static int motor_pins[16] = {17, 27, 22, 5, 6, 13, 19, 26, 18, 23, 24, 25, 12, 16, 20, 21};
+static int keypad_cols[3] = {2, 3, 4};
+static int keypad_rows[4] = {14, 15, 8, 7};
+
+static char keypad_map[4][3] = {
+    {'1','2','3'},
+    {'4','5','6'},
+    {'7','8','9'},
+    {'*','0','#'}
+};
 
 typedef struct {
     int h;
@@ -90,6 +100,14 @@ typedef struct {
     GtkWidget *usb_selected_label;
     char usb_selected_mount[512];
 
+    // Keypad Functionallity
+    GtkWidget *focused_widget[MAX_FOCUS_WIDGETS];
+    int focus_count;
+    int focus_index;
+
+    GtkWidget *current_grid;
+    int focused_row;
+    int focused_col;
 } App;
 
 typedef struct {
@@ -1006,9 +1024,32 @@ static void show_admin_extract(App *app) {
 static void gpio_setup_outputs(void) {
     for (int i = 0; i < 16; i++) {
         char cmd[128];
-        snprintf(cmd, sizeof(cmd), "raspi-gpio set %d op dl", motor_pins[i]);
+        snprintf(cmd, sizeof(cmd), "raspi-gpio set %d op dl", motor_pins[i]); //default low
         system(cmd);
     }
+    for (int i = 0; i < 3; i++) {
+        snprintf(smd, sizeof(cmd), "raspi-gpio set %d op dh", keypad_cols[i]); //default high
+        system(cmd);
+    }
+    for (int i = 0; i < 4; i++) {
+        snprintf(smd, sizeof(cmd), "raspi-gpio set %d ip pu", keypad_rows[i]); //pull up on these pins
+        system(cmd);
+    }
+}
+
+static int gpio_read(int pin) {
+    char cmd[64];
+    char buf[128];
+
+    snprintf(cmd, sizeof(cmd), "raspi-gpio get %d", pin);
+
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return -1;
+
+    fgets(buf, sizeof(buf), fp);
+    pclose(fp);
+
+    return (strstr(buf, "level=0") != NULL) ? 0 : 1;
 }
 
 static void gpio_write(int pin, int value) {
@@ -1091,6 +1132,123 @@ static void dispense(int slot) {
 
         gpio_write(motor_pins[12], 0);
         gpio_write(motor_pins[13], 0);
+    }
+}
+
+// ------------- Keypad specific Function -----------
+char keypad_read() {
+    for (int col = 0; col < 3; col++) {
+        gpio_write(keypad_cols[col], 0);
+        for (int row = 0; row < 4; row++) {
+            if((gpio_read(keypad_rows[row])) == 0) {
+                gpio_write(keypad_cols[col], 1); //might need to add 1 ms delays if it polls to fast.
+                return keypad_map[row][col];
+            }
+        }
+        gpio_write(keypad_cols[col], 1);
+    }
+    return 0; //no key pressed
+}
+
+static gboolean poll_keypad(gpointer user_data) {
+    App *app = (App *)user_data;
+    char key = keypad_read(); 
+
+    if (key) {
+        switch(key){
+            case '4' : ui_left(app); break;
+            case '6' : ui_right(app); break;
+            case '5' : ui_down(app); break;
+            case '2' : ui_up(app); break;
+            case '#' : ui_select(app); break;
+            case '*' : ui_back(app); break;
+            default : break;
+        }
+    }
+    return TRUE;
+}
+
+void ui_right(App *app) {
+    if (app -> focus_count == 0) { //handle no widets case, shouldn't occur
+        return;
+    }
+    app->focus_index++;
+    
+    if(app->focus_index >= app->focus_count) { //handle far right case
+        app ->focus_index = 0;
+    }
+    gtk_widget_grab_focus(app->focus_widgets[app->focus_index]); //move the focus
+}
+
+void ui_left(App *app) {
+    if (app -> focus_count == 0) { //handle no widets case, shouldn't occur
+        return;
+    }
+    app->focus_index--;
+
+     if(app->focus_index < 0) { //handle far left case
+        app ->focus_index = app->focus_count -1 ;
+    }
+    gtk_widget_grab_focus(app=>focus_index); //move the focus
+}
+
+void ui_up(App *app) {
+    ui_left(app); //this should change later but for now it's just a single array
+}
+
+void ui_down(App *app) {
+    ui_right(app); //same thing here
+}
+
+void ui_select(App *app) {
+    if (app->focus_count == 0) {
+        return; //handle case where there was nothing to select
+    }
+    GtkWidget *w = app->focus_widget[app->focus_index];
+
+    if(GTK_IS_BUTTON(w)) { //if it is a button, select it
+        gtk_button_clicked(GTK_BUTTON(w));
+    }
+}
+
+void ui_back(App *app) {
+    show_setting(app); //I think this will have to change since it only goes to the outside menu right now
+}
+
+// -------------------focus for keypad --------------
+void populate_focus_widgets(App *app, GtkWidget *root) {
+    app->focus_count = 0;
+    app->focus_index = 0;
+
+    scan_focusable(app, root);
+
+    if (app->focus_count > 0) {
+        gtk_widget_grab_focus(app->focus_widgets[0]);
+    }
+}
+
+//recursive function to get the widgets on a page
+static void scan_focusable(App *app, GtkWidget *w) {
+    if (!w) return;
+
+    if (GTK_IS_BUTTON(w) ||
+        GTK_IS_SPIN_BUTTON(w) ||
+        GTK_IS_ENTRY(w) ||
+        GTK_IS_TREE_VIEW(w)) {
+
+        if (app->focus_count < MAX_FOCUS_WIDGETS) {
+            app->focus_widgets[app->focus_count++] = w;
+        }
+    }
+
+    if (GTK_IS_CONTAINER(w)) {
+        GList *children = gtk_container_get_children(GTK_CONTAINER(w));
+
+        for (GList *l = children; l != NULL; l = l->next) {
+            scan_focusable(app, GTK_WIDGET(l->data));
+        }
+
+        g_list_free(children);
     }
 }
 
@@ -1552,14 +1710,44 @@ static GtkWidget *build_admin_extract_page(App *app) {
     return root;
 }
 
+//this will set up the border so that it's visible what is being highlighted, hopefully
+static void load_css(void)
+{
+    GtkCssProvider *provider = gtk_css_provider_new();
+
+    gtk_css_provider_load_from_data(provider,
+        "*:focus {"
+        "  border: 3px solid #4A90E2;"
+        "  background: #E6F2FF;"
+        "}",
+        -1,
+        NULL);
+
+    gtk_style_context_add_provider_for_screen(
+        gdk_screen_get_default(),
+        GTK_STYLE_PROVIDER(provider),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+
+    g_object_unref(provider);
+}
+
 // ------------------- main -------------------
 int main(int argc, char **argv) {
     App app;
     memset(&app, 0, sizeof(app));
+
+    app.focus_count = 0;
+    app.focus_index = 0;
+    app.current_grid = NULL;
+    app.focused_row = 0;
+    app.focused_col = 0;
+    
     app.wifi_selected_ssid[0] = 0;
     app.usb_selected_mount[0] = 0;
 
     gtk_init(&argc, &argv);
+
+    load_css();
 
     set_default_schedules(&app);
     load_schedules(&app);
@@ -1587,7 +1775,10 @@ int main(int argc, char **argv) {
     rebuild_today_schedule(&app);
     fill_schedule_spins_from_data(&app);
 
+    populate_focus_widgets(&app, app.stack); 
+
     gpio_setup_outputs();
+    g_timeout_add(50, poll_keypad, &app); //poll the keypad every 50 ms
 
     g_timeout_add(1000, tick_update_time, &app);
     tick_update_time(&app);
