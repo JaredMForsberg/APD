@@ -1023,11 +1023,11 @@ static void gpio_setup_outputs(void) {
         system(cmd);
     }
     for (int i = 0; i < 3; i++) {
-        snprintf(smd, sizeof(cmd), "raspi-gpio set %d op dh", keypad_cols[i]); //default high
+        snprintf(cmd, sizeof(cmd), "raspi-gpio set %d op dh", keypad_cols[i]); //default high
         system(cmd);
     }
     for (int i = 0; i < 4; i++) {
-        snprintf(smd, sizeof(cmd), "raspi-gpio set %d ip pu", keypad_rows[i]); //pull up on these pins
+        snprintf(cmd, sizeof(cmd), "raspi-gpio set %d ip pu", keypad_rows[i]); //pull up on these pins
         system(cmd);
     }
 }
@@ -1145,6 +1145,54 @@ char keypad_read() {
     return 0; //no key pressed
 }
 
+
+void ui_right(App *app) {
+    if (app -> focus_count == 0) { //handle no widets case, shouldn't occur
+        return;
+    }
+    app->focus_index++;
+    
+    if(app->focus_index >= app->focus_count) { //handle far right case
+        app ->focus_index = 0;
+    }
+    gtk_widget_grab_focus(app->focused_widget[app->focus_index]); //move the focus
+}
+
+void ui_left(App *app) {
+    if (app -> focus_count == 0) { //handle no widets case, shouldn't occur
+        return;
+    }
+    app->focus_index--;
+
+     if(app->focus_index < 0) { //handle far left case
+        app ->focus_index = app->focus_count -1 ;
+    }
+    gtk_widget_grab_focus(app->focused_widget[app->focus_index]); //move the focus
+}
+
+void ui_up(App *app) {
+    ui_left(app); //this should change later but for now it's just a single array
+}
+
+void ui_down(App *app) {
+    ui_right(app); //same thing here
+}
+
+void ui_select(App *app) {
+    if (app->focus_count == 0) {
+        return; //handle case where there was nothing to select
+    }
+    GtkWidget *w = app->focused_widget[app->focus_index];
+
+    if(GTK_IS_BUTTON(w)) { //if it is a button, select it
+        gtk_button_clicked(GTK_BUTTON(w));
+    }
+}
+
+void ui_back(App *app) {
+    show_settings(app); //I think this will have to change since it only goes to the outside menu right now
+}
+
 static gboolean poll_keypad(gpointer user_data) {
     App *app = (App *)user_data;
     char key = keypad_read(); 
@@ -1163,62 +1211,15 @@ static gboolean poll_keypad(gpointer user_data) {
     return TRUE;
 }
 
-void ui_right(App *app) {
-    if (app -> focus_count == 0) { //handle no widets case, shouldn't occur
-        return;
-    }
-    app->focus_index++;
-    
-    if(app->focus_index >= app->focus_count) { //handle far right case
-        app ->focus_index = 0;
-    }
-    gtk_widget_grab_focus(app->focus_widgets[app->focus_index]); //move the focus
-}
-
-void ui_left(App *app) {
-    if (app -> focus_count == 0) { //handle no widets case, shouldn't occur
-        return;
-    }
-    app->focus_index--;
-
-     if(app->focus_index < 0) { //handle far left case
-        app ->focus_index = app->focus_count -1 ;
-    }
-    gtk_widget_grab_focus(app=>focus_index); //move the focus
-}
-
-void ui_up(App *app) {
-    ui_left(app); //this should change later but for now it's just a single array
-}
-
-void ui_down(App *app) {
-    ui_right(app); //same thing here
-}
-
-void ui_select(App *app) {
-    if (app->focus_count == 0) {
-        return; //handle case where there was nothing to select
-    }
-    GtkWidget *w = app->focus_widget[app->focus_index];
-
-    if(GTK_IS_BUTTON(w)) { //if it is a button, select it
-        gtk_button_clicked(GTK_BUTTON(w));
-    }
-}
-
-void ui_back(App *app) {
-    show_setting(app); //I think this will have to change since it only goes to the outside menu right now
-}
-
 // -------------------focus for keypad --------------
-void populate_focus_widgets(App *app, GtkWidget *root) {
+void populate_focus_widget(App *app, GtkWidget *root) {
     app->focus_count = 0;
     app->focus_index = 0;
 
     scan_focusable(app, root);
 
     if (app->focus_count > 0) {
-        gtk_widget_grab_focus(app->focus_widgets[0]);
+        gtk_widget_grab_focus(app->focused_widget[0]);
     }
 }
 
@@ -1232,7 +1233,7 @@ static void scan_focusable(App *app, GtkWidget *w) {
         GTK_IS_TREE_VIEW(w)) {
 
         if (app->focus_count < MAX_FOCUS_WIDGETS) {
-            app->focus_widgets[app->focus_count++] = w;
+            app->focused_widget[app->focus_count++] = w;
         }
     }
 
@@ -1770,7 +1771,7 @@ int main(int argc, char **argv) {
     rebuild_today_schedule(&app);
     fill_schedule_spins_from_data(&app);
 
-    populate_focus_widgets(&app, app.stack); 
+    populate_focus_widget(&app, app.stack); 
 
     gpio_setup_outputs();
     g_timeout_add(50, poll_keypad, &app); //poll the keypad every 50 ms
