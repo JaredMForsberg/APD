@@ -1284,14 +1284,14 @@ static GtkWidget *get_current_focus_widget(App *app) {
 static const char *key_chars_for_digit(char key) {
     switch (key) {
         case '1': return ".@-_1";
-        case '2': return "abc2";
-        case '3': return "def3";
-        case '4': return "ghi4";
-        case '5': return "jkl5";
-        case '6': return "mno6";
-        case '7': return "pqrs7";
-        case '8': return "tuv8";
-        case '9': return "wxyz9";
+        case '2': return "ABCabc2";
+        case '3': return "DEFdef3";
+        case '4': return "GHIghi4";
+        case '5': return "JKLjkl5";
+        case '6': return "MNOmno6";
+        case '7': return "PQRSpqrs7";
+        case '8': return "TUVtuv8";
+        case '9': return "WXYZwxyz9";
         case '0': return " 0";
         default:  return NULL;
     }
