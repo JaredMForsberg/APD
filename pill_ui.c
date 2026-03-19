@@ -11,12 +11,13 @@
 #define DEV_FILE_PATH   "/home/autopilldispense/Desktop/pill_ui.c"
 #define SCHEDULE_FILE   ".pill_dispenser_schedule.txt"
 #define ADMIN_LOG_PATH  "/home/autopilldispense/Desktop/admin.txt"
+#define ADMIN_CODE_FILE ".pill_admin_code.txt"
 #define MAX_TIMES       10
 #define MAX_FOCUS_WIDGETS 310
 
 static const char *DAYS[7] = {"Mon","Tue","Wed","Thu","Fri","Sat","Sun"};
 static int motor_pins[8] = {17, 27, 22, 5, 6, 13, 19, 26};
-//blue, yellow, red, black, green, yellow w/ strip, green w/ strip, blue w/ strip
+/* blue, yellow, red, black, green, yellow w/ stripe, green w/ stripe, blue w/ stripe */
 static int keypad_cols[3] = {2, 3, 4};
 static int keypad_rows[4] = {14, 15, 8, 7};
 
@@ -73,6 +74,23 @@ typedef struct {
     GtkWidget *usb_selected_label;
     char usb_selected_mount[512];
 
+    GtkWidget *power_code_entry;
+    GtkWidget *power_status_label;
+
+    GtkWidget *admin_code_current_label;
+    GtkWidget *admin_code_prompt_label;
+    GtkWidget *admin_code_entry;
+    GtkWidget *admin_code_status_label;
+    GtkWidget *admin_code_action_button;
+    char admin_code[256];
+    char admin_code_temp[256];
+    int admin_code_mgr_state;
+
+    GtkWidget *admin_gate_prompt_label;
+    GtkWidget *admin_gate_entry;
+    GtkWidget *admin_gate_status_label;
+    int admin_gate_target;
+
     GtkWidget *focused_widget[MAX_FOCUS_WIDGETS];
     int focus_count;
     int focus_index;
@@ -82,6 +100,10 @@ typedef struct {
     char pending_digit;
     int pending_index;
     guint pending_commit_timer;
+    GtkWidget *pending_entry;
+
+    guint hash_arm_timer;
+    GtkWidget *hash_armed_entry;
 } App;
 
 typedef struct {
@@ -90,11 +112,32 @@ typedef struct {
     int slot;
 } DaySlotRef;
 
+enum {
+    ADMIN_GATE_NONE = 0,
+    ADMIN_GATE_EXTRACT = 1,
+    ADMIN_GATE_RESET = 2
+};
+
 static void scan_focusable(App *app, GtkWidget *w);
 static void populate_focus_widgets(App *app, GtkWidget *root);
 static void refresh_focus_for_current_page(App *app);
 static GtkWidget *get_current_focus_widget(App *app);
 static void tree_move_selection(GtkWidget *tree, int dir);
+
+static void show_power_admin(App *app);
+static void show_admin_code_manager(App *app);
+static void show_admin_extract(App *app);
+static void show_admin_gate(App *app, int target);
+static void entry_commit_pending(App *app);
+static void clear_entry_hash_arm(App *app);
+static void on_wifi_connect(GtkWidget *widget, gpointer user_data);
+static void on_power_shutdown(GtkWidget *widget, gpointer user_data);
+static void on_admin_code_action(GtkWidget *widget, gpointer user_data);
+static void on_admin_gate_continue(GtkWidget *widget, gpointer user_data);
+static void on_request_admin_extract(GtkWidget *w, gpointer user_data);
+static void on_request_admin_reset(GtkWidget *w, gpointer user_data);
+static void reset_admin_code_manager_ui(App *app);
+static GtkWidget *build_admin_gate_page(App *app);
 
 static void trim(char *s) {
     if (!s) return;
@@ -157,7 +200,7 @@ static GtkWidget *make_top_icon_button(const char *icon_name) {
 
     gtk_button_set_image(GTK_BUTTON(btn), img);
     gtk_button_set_always_show_image(GTK_BUTTON(btn), TRUE);
-    gtk_widget_set_size_request(btn, 44, 44);
+    gtk_widget_set_size_request(btn, 36, 36);
     gtk_widget_set_can_focus(btn, TRUE);
     gtk_button_set_focus_on_click(GTK_BUTTON(btn), TRUE);
 
@@ -180,9 +223,11 @@ static int time_compare(const void *a, const void *b) {
     if (!ta->enabled) return 1;
     if (!tb->enabled) return -1;
 
-    int ma = ta->h * 60 + ta->m;
-    int mb = tb->h * 60 + tb->m;
-    return ma - mb;
+    {
+        int ma = ta->h * 60 + ta->m;
+        int mb = tb->h * 60 + tb->m;
+        return ma - mb;
+    }
 }
 
 static void sort_slot_times(App *app, int day, int slot) {
@@ -220,6 +265,62 @@ static void get_schedule_path(char *out, size_t outsz) {
     const char *home = getenv("HOME");
     if (!home) home = "/home/pi";
     snprintf(out, outsz, "%s/%s", home, SCHEDULE_FILE);
+}
+
+static void get_admin_code_path(char *out, size_t outsz) {
+    const char *home = getenv("HOME");
+    if (!home) home = "/home/pi";
+    snprintf(out, outsz, "%s/%s", home, ADMIN_CODE_FILE);
+}
+
+static int admin_code_is_set(App *app) {
+    return (app->admin_code[0] != '\0');
+}
+
+static int admin_code_matches(App *app, const char *entered) {
+    if (!entered) return 0;
+    return strcmp(app->admin_code, entered) == 0;
+}
+
+static int save_admin_code_value(App *app, const char *code) {
+    char path[512];
+    FILE *f;
+
+    get_admin_code_path(path, sizeof(path));
+    f = fopen(path, "w");
+    if (!f) return 0;
+
+    fprintf(f, "%s\n", code ? code : "");
+    fclose(f);
+
+    strncpy(app->admin_code, code ? code : "", sizeof(app->admin_code) - 1);
+    app->admin_code[sizeof(app->admin_code) - 1] = 0;
+    return 1;
+}
+
+static int load_admin_code(App *app) {
+    char path[512];
+    FILE *f;
+    char line[512];
+
+    app->admin_code[0] = 0;
+
+    get_admin_code_path(path, sizeof(path));
+    f = fopen(path, "r");
+    if (!f) return 0;
+
+    if (fgets(line, sizeof(line), f)) {
+        trim(line);
+        strncpy(app->admin_code, line, sizeof(app->admin_code) - 1);
+        app->admin_code[sizeof(app->admin_code) - 1] = 0;
+    }
+
+    fclose(f);
+    return (app->admin_code[0] != 0);
+}
+
+static int clear_admin_code_value(App *app) {
+    return save_admin_code_value(app, "");
 }
 
 static int save_schedules(App *app) {
@@ -490,12 +591,6 @@ static int admin_log_clear(void) {
     return 1;
 }
 
-static int pkexec_auth_ping(void) {
-    int rc = system("pkexec /usr/bin/true >/dev/null 2>&1");
-    if (rc == -1) return -1;
-    return (rc == 0) ? 0 : 1;
-}
-
 static int run_keypad_dialog(App *app,
                              const char *title,
                              const char *primary,
@@ -591,27 +686,8 @@ static void run_info_dialog(App *app,
 
 static void on_power_clicked(GtkWidget *w, gpointer user_data) {
     App *app = (App *)user_data;
-    int resp;
-
     (void)w;
-
-    resp = run_keypad_dialog(
-        app,
-        "Shutdown",
-        "Shut down the Raspberry Pi now?",
-        "This will power off the device. You will need to turn it back on manually.",
-        "Shut Down",
-        "Cancel"
-    );
-
-    if (resp != GTK_RESPONSE_OK) return;
-
-    while (1) {
-        int auth = pkexec_auth_ping();
-        if (auth == 0) break;
-    }
-
-    system("pkexec /usr/bin/systemctl poweroff");
+    show_power_admin(app);
 }
 
 static void on_dev_edit_clicked(GtkWidget *w, gpointer user_data) {
@@ -803,8 +879,61 @@ static gboolean command_exists(const char *cmd) {
     return system(buf) == 0;
 }
 
+static int run_argv_capture(char **argv, char **out_text, char **err_text) {
+    GError *error = NULL;
+    gint status = -1;
+    gboolean ok;
+
+    if (out_text) *out_text = NULL;
+    if (err_text) *err_text = NULL;
+
+    ok = g_spawn_sync(
+        NULL,
+        argv,
+        NULL,
+        G_SPAWN_SEARCH_PATH,
+        NULL,
+        NULL,
+        out_text,
+        err_text,
+        &status,
+        &error
+    );
+
+    if (!ok) {
+        if (err_text) {
+            *err_text = g_strdup(error ? error->message : "Failed to start command.");
+        }
+        if (error) g_error_free(error);
+        return -1;
+    }
+
+    if (status == 0) return 0;
+    return status;
+}
+
+static void set_wifi_status_from_nmcli(App *app, const char *prefix, const char *out_text, const char *err_text) {
+    char msg[1024];
+    const char *detail = NULL;
+    char detail_buf[800];
+
+    if (err_text && err_text[0]) detail = err_text;
+    else if (out_text && out_text[0]) detail = out_text;
+    else detail = "Unknown error.";
+
+    strncpy(detail_buf, detail, sizeof(detail_buf) - 1);
+    detail_buf[sizeof(detail_buf) - 1] = 0;
+    trim(detail_buf);
+
+    if (prefix && prefix[0]) snprintf(msg, sizeof(msg), "%s %s", prefix, detail_buf);
+    else snprintf(msg, sizeof(msg), "%s", detail_buf);
+
+    trim(msg);
+    ui_set_status(app->wifi_status_label, msg);
+}
+
 static void wifi_update_current(App *app) {
-    FILE *fp = popen("nmcli -t -f ACTIVE,SSID dev wifi 2>/dev/null | grep '^yes:' | head -n 1", "r");
+    FILE *fp = popen("sudo -n nmcli -t -f ACTIVE,SSID dev wifi 2>/dev/null | grep '^yes:' | head -n 1", "r");
     if (!fp) {
         gtk_label_set_text(GTK_LABEL(app->wifi_current_label), "Current: (unable to query)");
         return;
@@ -842,13 +971,15 @@ static void wifi_scan_and_fill(App *app) {
 
     gtk_list_store_clear(app->wifi_store);
 
-    fp = popen("nmcli -t -f SSID,SIGNAL,SECURITY dev wifi list --rescan yes 2>/dev/null", "r");
+    fp = popen("sudo -n nmcli -t -f SSID,SIGNAL,SECURITY dev wifi list --rescan yes 2>/dev/null", "r");
     if (!fp) {
         ui_set_status(app->wifi_status_label, "Failed to scan Wi-Fi.");
         return;
     }
 
     while (fgets(line, sizeof(line), fp)) {
+        char *last1;
+        char *last2;
         char *ssid;
         char *signal;
         char *security;
@@ -857,16 +988,22 @@ static void wifi_scan_and_fill(App *app) {
         trim(line);
         if (!line[0]) continue;
 
-        ssid = strtok(line, ":");
-        signal = strtok(NULL, ":");
-        security = strtok(NULL, ":");
+        last1 = strrchr(line, ':');
+        if (!last1) continue;
+        *last1 = '\0';
+        security = last1 + 1;
 
-        if (!ssid) continue;
+        last2 = strrchr(line, ':');
+        if (!last2) continue;
+        *last2 = '\0';
+        signal = last2 + 1;
+        ssid = line;
+
         trim(ssid);
-        if (!ssid[0]) continue;
+        trim(signal);
+        trim(security);
 
-        if (!signal) signal = (char *)"";
-        if (!security) security = (char *)"";
+        if (!ssid[0]) continue;
 
         gtk_list_store_append(app->wifi_store, &iter);
         gtk_list_store_set(app->wifi_store, &iter, 0, ssid, 1, signal, 2, security, -1);
@@ -877,7 +1014,7 @@ static void wifi_scan_and_fill(App *app) {
     wifi_update_current(app);
 
     if (added == 0) ui_set_status(app->wifi_status_label, "No networks found.");
-    else ui_set_status(app->wifi_status_label, "Select a network, enter password if needed, then Connect.");
+    else ui_set_status(app->wifi_status_label, "Select a network, enter password, then press Connect. Keypad: press # twice to submit.");
 }
 
 static void on_wifi_selection_changed(GtkTreeSelection *selection, gpointer user_data) {
@@ -909,59 +1046,71 @@ static void on_wifi_rescan(GtkWidget *widget, gpointer user_data) {
 static void on_wifi_connect(GtkWidget *widget, gpointer user_data) {
     App *app = (App *)user_data;
     const char *pw;
-    char cmd[1024];
+    char *out_text = NULL;
+    char *err_text = NULL;
     int rc;
 
     (void)widget;
+
+    clear_entry_hash_arm(app);
+    entry_commit_pending(app);
 
     if (!app->wifi_selected_ssid[0]) {
         ui_set_status(app->wifi_status_label, "Pick a network first.");
         return;
     }
+
     if (!command_exists("nmcli")) {
         ui_set_status(app->wifi_status_label, "nmcli not found.");
         return;
     }
 
-    if (app->pending_commit_timer) {
-        g_source_remove(app->pending_commit_timer);
-        app->pending_commit_timer = 0;
-    }
-    app->pending_digit = 0;
-    app->pending_index = 0;
-
     pw = gtk_entry_get_text(GTK_ENTRY(app->wifi_pass_entry));
-    if (strchr(app->wifi_selected_ssid, '"') || (pw && strchr(pw, '"'))) {
-        ui_set_status(app->wifi_status_label, "SSID/password cannot contain quotes (\").");
-        return;
-    }
+    if (!pw) pw = "";
 
-    if (pw && pw[0]) {
-        snprintf(cmd, sizeof(cmd),
-                 "pkexec nmcli dev wifi connect \"%s\" password \"%s\"",
-                 app->wifi_selected_ssid, pw);
+    ui_set_status(app->wifi_status_label, "Connecting...");
+    while (gtk_events_pending()) gtk_main_iteration();
+
+    if (pw[0]) {
+        char *argv_connect[] = {
+            "sudo",
+            "-n",
+            "nmcli",
+            "-w", "20",
+            "dev", "wifi", "connect",
+            app->wifi_selected_ssid,
+            "password", (char *)pw,
+            NULL
+        };
+        rc = run_argv_capture(argv_connect, &out_text, &err_text);
     } else {
-        snprintf(cmd, sizeof(cmd),
-                 "pkexec nmcli dev wifi connect \"%s\"",
-                 app->wifi_selected_ssid);
+        char *argv_connect[] = {
+            "sudo",
+            "-n",
+            "nmcli",
+            "-w", "20",
+            "dev", "wifi", "connect",
+            app->wifi_selected_ssid,
+            NULL
+        };
+        rc = run_argv_capture(argv_connect, &out_text, &err_text);
     }
 
-    ui_set_status(app->wifi_status_label, "Connecting... (auth prompt may appear)");
-    rc = system(cmd);
+    if (rc == 0) {
+        ui_set_status(app->wifi_status_label, "Connected.");
+    } else {
+        set_wifi_status_from_nmcli(app, "Connect failed:", out_text, err_text);
+    }
 
-    if (rc == 0) ui_set_status(app->wifi_status_label, "Connected (or connection initiated).");
-    else ui_set_status(app->wifi_status_label, "Failed to connect.");
+    g_free(out_text);
+    g_free(err_text);
 
     wifi_update_current(app);
 }
 
 static void show_wifi(App *app) {
-    if (app->pending_commit_timer) {
-        g_source_remove(app->pending_commit_timer);
-        app->pending_commit_timer = 0;
-    }
-    app->pending_digit = 0;
-    app->pending_index = 0;
+    clear_entry_hash_arm(app);
+    entry_commit_pending(app);
 
     ui_set_status(app->wifi_status_label, "");
     gtk_entry_set_text(GTK_ENTRY(app->wifi_pass_entry), "");
@@ -971,33 +1120,318 @@ static void show_wifi(App *app) {
     wifi_scan_and_fill(app);
 }
 
-static void on_admin_reset(GtkWidget *w, gpointer user_data) {
+static void refresh_admin_code_current_label(App *app) {
+    if (!app->admin_code_current_label) return;
+
+    if (admin_code_is_set(app)) {
+        gtk_label_set_text(GTK_LABEL(app->admin_code_current_label), "Current admin code: Set");
+    } else {
+        gtk_label_set_text(GTK_LABEL(app->admin_code_current_label), "Current admin code: Not set");
+    }
+}
+
+static void reset_admin_code_manager_ui(App *app) {
+    clear_entry_hash_arm(app);
+    entry_commit_pending(app);
+
+    app->admin_code_temp[0] = 0;
+    app->admin_code_mgr_state = 0;
+
+    if (app->admin_code_entry) {
+        gtk_entry_set_text(GTK_ENTRY(app->admin_code_entry), "");
+    }
+    if (app->admin_code_status_label) {
+        ui_set_status(app->admin_code_status_label, "");
+    }
+
+    refresh_admin_code_current_label(app);
+
+    if (!app->admin_code_prompt_label || !app->admin_code_action_button) return;
+
+    if (admin_code_is_set(app)) {
+        gtk_label_set_text(GTK_LABEL(app->admin_code_prompt_label),
+                           "Enter current admin code, then press Continue.");
+    } else {
+        gtk_label_set_text(GTK_LABEL(app->admin_code_prompt_label),
+                           "No admin code is set. Enter a new admin code, then press Continue.");
+    }
+
+    gtk_button_set_label(GTK_BUTTON(app->admin_code_action_button), "Continue");
+}
+
+static void on_admin_code_action(GtkWidget *widget, gpointer user_data) {
     App *app = (App *)user_data;
-    int resp;
+    const char *txt;
 
+    (void)widget;
+
+    clear_entry_hash_arm(app);
+    entry_commit_pending(app);
+
+    txt = gtk_entry_get_text(GTK_ENTRY(app->admin_code_entry));
+    if (!txt) txt = "";
+
+    if (!admin_code_is_set(app)) {
+        if (app->admin_code_mgr_state == 0) {
+            if (!txt[0]) {
+                ui_set_status(app->admin_code_status_label, "Enter a new admin code first.");
+                return;
+            }
+
+            strncpy(app->admin_code_temp, txt, sizeof(app->admin_code_temp) - 1);
+            app->admin_code_temp[sizeof(app->admin_code_temp) - 1] = 0;
+            gtk_entry_set_text(GTK_ENTRY(app->admin_code_entry), "");
+            gtk_label_set_text(GTK_LABEL(app->admin_code_prompt_label),
+                               "Confirm the new admin code, then press Save.");
+            gtk_button_set_label(GTK_BUTTON(app->admin_code_action_button), "Save");
+            ui_set_status(app->admin_code_status_label, "");
+            app->admin_code_mgr_state = 1;
+            return;
+        }
+
+        if (app->admin_code_mgr_state == 1) {
+            if (strcmp(txt, app->admin_code_temp) != 0) {
+                reset_admin_code_manager_ui(app);
+                ui_set_status(app->admin_code_status_label, "Codes did not match. Start over.");
+                return;
+            }
+
+            if (!save_admin_code_value(app, app->admin_code_temp)) {
+                ui_set_status(app->admin_code_status_label, "Failed to save admin code.");
+                return;
+            }
+
+            reset_admin_code_manager_ui(app);
+            ui_set_status(app->admin_code_status_label, "Admin code saved.");
+            return;
+        }
+    } else {
+        if (app->admin_code_mgr_state == 0) {
+            if (!admin_code_matches(app, txt)) {
+                ui_set_status(app->admin_code_status_label, "Current admin code is incorrect.");
+                gtk_entry_set_text(GTK_ENTRY(app->admin_code_entry), "");
+                return;
+            }
+
+            gtk_entry_set_text(GTK_ENTRY(app->admin_code_entry), "");
+            gtk_label_set_text(GTK_LABEL(app->admin_code_prompt_label),
+                               "Enter the new admin code, then press Continue.");
+            gtk_button_set_label(GTK_BUTTON(app->admin_code_action_button), "Continue");
+            ui_set_status(app->admin_code_status_label, "");
+            app->admin_code_mgr_state = 1;
+            return;
+        }
+
+        if (app->admin_code_mgr_state == 1) {
+            if (!txt[0]) {
+                ui_set_status(app->admin_code_status_label, "Enter a new admin code first.");
+                return;
+            }
+
+            strncpy(app->admin_code_temp, txt, sizeof(app->admin_code_temp) - 1);
+            app->admin_code_temp[sizeof(app->admin_code_temp) - 1] = 0;
+            gtk_entry_set_text(GTK_ENTRY(app->admin_code_entry), "");
+            gtk_label_set_text(GTK_LABEL(app->admin_code_prompt_label),
+                               "Confirm the new admin code, then press Save.");
+            gtk_button_set_label(GTK_BUTTON(app->admin_code_action_button), "Save");
+            ui_set_status(app->admin_code_status_label, "");
+            app->admin_code_mgr_state = 2;
+            return;
+        }
+
+        if (app->admin_code_mgr_state == 2) {
+            if (strcmp(txt, app->admin_code_temp) != 0) {
+                gtk_entry_set_text(GTK_ENTRY(app->admin_code_entry), "");
+                gtk_label_set_text(GTK_LABEL(app->admin_code_prompt_label),
+                                   "Enter the new admin code, then press Continue.");
+                gtk_button_set_label(GTK_BUTTON(app->admin_code_action_button), "Continue");
+                ui_set_status(app->admin_code_status_label, "Codes did not match. Enter the new code again.");
+                app->admin_code_mgr_state = 1;
+                return;
+            }
+
+            if (!save_admin_code_value(app, app->admin_code_temp)) {
+                ui_set_status(app->admin_code_status_label, "Failed to update admin code.");
+                return;
+            }
+
+            reset_admin_code_manager_ui(app);
+            ui_set_status(app->admin_code_status_label, "Admin code updated.");
+            return;
+        }
+    }
+}
+
+static void show_admin_code_manager(App *app) {
+    reset_admin_code_manager_ui(app);
+    show_page(app, "admin_code_manager");
+}
+
+static void show_admin_gate(App *app, int target) {
+    clear_entry_hash_arm(app);
+    entry_commit_pending(app);
+
+    app->admin_gate_target = target;
+
+    if (app->admin_gate_entry) {
+        gtk_entry_set_text(GTK_ENTRY(app->admin_gate_entry), "");
+    }
+    if (app->admin_gate_status_label) {
+        ui_set_status(app->admin_gate_status_label, "");
+    }
+
+    if (app->admin_gate_prompt_label) {
+        if (target == ADMIN_GATE_EXTRACT) {
+            gtk_label_set_text(GTK_LABEL(app->admin_gate_prompt_label),
+                               "Enter the admin code to continue to Admin Extract.");
+        } else if (target == ADMIN_GATE_RESET) {
+            gtk_label_set_text(GTK_LABEL(app->admin_gate_prompt_label),
+                               "Enter the admin code to continue to Admin Reset.");
+        } else {
+            gtk_label_set_text(GTK_LABEL(app->admin_gate_prompt_label),
+                               "Enter the admin code to continue.");
+        }
+    }
+
+    if (admin_code_is_set(app)) {
+        ui_set_status(app->admin_gate_status_label, "Press Continue after entering the admin code.");
+    } else {
+        ui_set_status(app->admin_gate_status_label,
+                      "No admin code is set. Go to Settings > Admin Code Manager first.");
+    }
+
+    show_page(app, "admin_gate");
+}
+
+static void on_admin_gate_continue(GtkWidget *widget, gpointer user_data) {
+    App *app = (App *)user_data;
+    const char *entered;
+
+    (void)widget;
+
+    clear_entry_hash_arm(app);
+    entry_commit_pending(app);
+
+    if (!admin_code_is_set(app)) {
+        ui_set_status(app->admin_gate_status_label,
+                      "No admin code is set. Go to Settings > Admin Code Manager first.");
+        return;
+    }
+
+    entered = gtk_entry_get_text(GTK_ENTRY(app->admin_gate_entry));
+    if (!entered || !entered[0]) {
+        ui_set_status(app->admin_gate_status_label, "Enter the admin code first.");
+        return;
+    }
+
+    if (!admin_code_matches(app, entered)) {
+        ui_set_status(app->admin_gate_status_label, "Incorrect admin code.");
+        gtk_entry_set_text(GTK_ENTRY(app->admin_gate_entry), "");
+        return;
+    }
+
+    ui_set_status(app->admin_gate_status_label, "");
+
+    if (app->admin_gate_target == ADMIN_GATE_EXTRACT) {
+        show_admin_extract(app);
+        return;
+    }
+
+    if (app->admin_gate_target == ADMIN_GATE_RESET) {
+        int resp = run_keypad_dialog(
+            app,
+            "Admin Reset",
+            "Admin Reset?",
+            "This will reset schedules back to default, erase all logs in admin.txt, and clear the admin code.",
+            "Reset",
+            "Cancel"
+        );
+
+        if (resp != GTK_RESPONSE_OK) {
+            show_settings(app);
+            return;
+        }
+
+        set_default_schedules(app);
+        save_schedules(app);
+        admin_log_clear();
+        clear_admin_code_value(app);
+        admin_log_append_snapshot(app, "Admin reset (defaults applied, admin code cleared)");
+
+        rebuild_today_schedule(app);
+        fill_schedule_spins_from_data(app);
+        reset_admin_code_manager_ui(app);
+
+        ui_set_status(app->admin_status_label, "Reset complete: defaults applied + admin.txt cleared + admin code cleared.");
+        show_settings(app);
+        refresh_focus_for_current_page(app);
+        return;
+    }
+
+    show_settings(app);
+}
+
+static void on_request_admin_extract(GtkWidget *w, gpointer user_data) {
+    App *app = (App *)user_data;
     (void)w;
+    show_admin_gate(app, ADMIN_GATE_EXTRACT);
+}
 
-    resp = run_keypad_dialog(
-        app,
-        "Admin Reset",
-        "Admin Reset?",
-        "This will reset schedules back to default and erase all logs in admin.txt.",
-        "Reset",
-        "Cancel"
-    );
+static void on_request_admin_reset(GtkWidget *w, gpointer user_data) {
+    App *app = (App *)user_data;
+    (void)w;
+    show_admin_gate(app, ADMIN_GATE_RESET);
+}
 
-    if (resp != GTK_RESPONSE_OK) return;
+static void on_power_shutdown(GtkWidget *widget, gpointer user_data) {
+    App *app = (App *)user_data;
+    const char *entered;
+    int rc;
 
-    set_default_schedules(app);
-    save_schedules(app);
-    admin_log_clear();
-    admin_log_append_snapshot(app, "Admin reset (defaults applied)");
+    (void)widget;
 
-    rebuild_today_schedule(app);
-    fill_schedule_spins_from_data(app);
+    clear_entry_hash_arm(app);
+    entry_commit_pending(app);
 
-    ui_set_status(app->admin_status_label, "Reset complete: defaults applied + admin.txt cleared.");
-    refresh_focus_for_current_page(app);
+    if (!admin_code_is_set(app)) {
+        ui_set_status(app->power_status_label,
+                      "No admin code is set. Go to Settings > Admin Code Manager first.");
+        return;
+    }
+
+    entered = gtk_entry_get_text(GTK_ENTRY(app->power_code_entry));
+    if (!entered || !entered[0]) {
+        ui_set_status(app->power_status_label, "Enter the admin code first.");
+        return;
+    }
+
+    if (!admin_code_matches(app, entered)) {
+        ui_set_status(app->power_status_label, "Incorrect admin code.");
+        gtk_entry_set_text(GTK_ENTRY(app->power_code_entry), "");
+        return;
+    }
+
+    ui_set_status(app->power_status_label, "Shutting down...");
+    while (gtk_events_pending()) gtk_main_iteration();
+
+    rc = system("sudo shutdown -h now");
+    if (rc != 0) {
+        ui_set_status(app->power_status_label, "Shutdown command failed.");
+    }
+}
+
+static void show_power_admin(App *app) {
+    clear_entry_hash_arm(app);
+    entry_commit_pending(app);
+
+    gtk_entry_set_text(GTK_ENTRY(app->power_code_entry), "");
+    if (admin_code_is_set(app)) {
+        ui_set_status(app->power_status_label, "Enter admin code, then press Shutdown.");
+    } else {
+        ui_set_status(app->power_status_label,
+                      "No admin code is set. Go to Settings > Admin Code Manager first.");
+    }
+    show_page(app, "power_admin");
 }
 
 static void usb_clear_store(App *app) {
@@ -1273,13 +1707,14 @@ static const char *key_chars_for_digit(char key) {
     }
 }
 
-static void wifi_entry_commit_pending(App *app) {
+static void entry_commit_pending(App *app) {
     if (app->pending_commit_timer) {
         g_source_remove(app->pending_commit_timer);
         app->pending_commit_timer = 0;
     }
     app->pending_digit = 0;
     app->pending_index = 0;
+    app->pending_entry = NULL;
 }
 
 static gboolean commit_pending_char_cb(gpointer user_data) {
@@ -1287,16 +1722,34 @@ static gboolean commit_pending_char_cb(gpointer user_data) {
     app->pending_digit = 0;
     app->pending_index = 0;
     app->pending_commit_timer = 0;
+    app->pending_entry = NULL;
     return FALSE;
 }
 
-static void wifi_entry_backspace(App *app) {
+static gboolean entry_hash_timeout_cb(gpointer user_data) {
+    App *app = (App *)user_data;
+    app->hash_arm_timer = 0;
+    app->hash_armed_entry = NULL;
+    return FALSE;
+}
+
+static void clear_entry_hash_arm(App *app) {
+    if (app->hash_arm_timer) {
+        g_source_remove(app->hash_arm_timer);
+        app->hash_arm_timer = 0;
+    }
+    app->hash_armed_entry = NULL;
+}
+
+static void entry_backspace(App *app, GtkWidget *entry) {
     GtkEditable *ed;
     gint pos, start, end;
 
-    if (!GTK_IS_ENTRY(app->wifi_pass_entry)) return;
+    (void)app;
 
-    ed = GTK_EDITABLE(app->wifi_pass_entry);
+    if (!GTK_IS_ENTRY(entry)) return;
+
+    ed = GTK_EDITABLE(entry);
     pos = gtk_editable_get_position(ed);
 
     if (gtk_editable_get_selection_bounds(ed, &start, &end)) {
@@ -1311,14 +1764,16 @@ static void wifi_entry_backspace(App *app) {
     }
 }
 
-static void wifi_entry_replace_last_char(App *app, char ch) {
+static void entry_replace_last_char(App *app, GtkWidget *entry, char ch) {
     GtkEditable *ed;
     gint pos;
     char s[2];
 
-    if (!GTK_IS_ENTRY(app->wifi_pass_entry)) return;
+    (void)app;
 
-    ed = GTK_EDITABLE(app->wifi_pass_entry);
+    if (!GTK_IS_ENTRY(entry)) return;
+
+    ed = GTK_EDITABLE(entry);
     pos = gtk_editable_get_position(ed);
     s[0] = ch;
     s[1] = '\0';
@@ -1332,14 +1787,16 @@ static void wifi_entry_replace_last_char(App *app, char ch) {
     gtk_editable_set_position(ed, pos);
 }
 
-static void wifi_entry_append_char(App *app, char ch) {
+static void entry_append_char(App *app, GtkWidget *entry, char ch) {
     GtkEditable *ed;
     gint pos;
     char s[2];
 
-    if (!GTK_IS_ENTRY(app->wifi_pass_entry)) return;
+    (void)app;
 
-    ed = GTK_EDITABLE(app->wifi_pass_entry);
+    if (!GTK_IS_ENTRY(entry)) return;
+
+    ed = GTK_EDITABLE(entry);
     pos = gtk_editable_get_position(ed);
     s[0] = ch;
     s[1] = '\0';
@@ -1348,21 +1805,16 @@ static void wifi_entry_append_char(App *app, char ch) {
     gtk_editable_set_position(ed, pos);
 }
 
-static void wifi_entry_handle_key(App *app, char key) {
+static void entry_handle_key(App *app, GtkWidget *entry, char key) {
     const char *chars;
     size_t len;
     char ch;
 
-    if (!GTK_IS_ENTRY(app->wifi_pass_entry)) return;
+    if (!GTK_IS_ENTRY(entry)) return;
 
     if (key == '*') {
-        wifi_entry_commit_pending(app);
-        wifi_entry_backspace(app);
-        return;
-    }
-
-    if (key == '#') {
-        wifi_entry_commit_pending(app);
+        entry_commit_pending(app);
+        entry_backspace(app, entry);
         return;
     }
 
@@ -1372,23 +1824,43 @@ static void wifi_entry_handle_key(App *app, char key) {
     len = strlen(chars);
     if (len == 0) return;
 
-    if (app->pending_digit == key) {
+    if (app->pending_digit == key && app->pending_entry == entry) {
         app->pending_index = (app->pending_index + 1) % (int)len;
         ch = chars[app->pending_index];
-        wifi_entry_replace_last_char(app, ch);
+        entry_replace_last_char(app, entry, ch);
 
         if (app->pending_commit_timer) {
             g_source_remove(app->pending_commit_timer);
         }
         app->pending_commit_timer = g_timeout_add(1000, commit_pending_char_cb, app);
     } else {
-        wifi_entry_commit_pending(app);
+        entry_commit_pending(app);
 
         app->pending_digit = key;
         app->pending_index = 0;
+        app->pending_entry = entry;
         ch = chars[0];
-        wifi_entry_append_char(app, ch);
+        entry_append_char(app, entry, ch);
         app->pending_commit_timer = g_timeout_add(1000, commit_pending_char_cb, app);
+    }
+}
+
+static void entry_submit_current(App *app, GtkWidget *entry) {
+    if (entry == app->wifi_pass_entry) {
+        on_wifi_connect(NULL, app);
+        return;
+    }
+    if (entry == app->power_code_entry) {
+        on_power_shutdown(NULL, app);
+        return;
+    }
+    if (entry == app->admin_code_entry) {
+        on_admin_code_action(NULL, app);
+        return;
+    }
+    if (entry == app->admin_gate_entry) {
+        on_admin_gate_continue(NULL, app);
+        return;
     }
 }
 
@@ -1550,6 +2022,12 @@ static void ui_back(App *app) {
         return;
     } else if (strcmp(page, "settings") == 0) {
         show_main(app);
+    } else if (strcmp(page, "power_admin") == 0) {
+        show_main(app);
+    } else if (strcmp(page, "admin_code_manager") == 0) {
+        show_settings(app);
+    } else if (strcmp(page, "admin_gate") == 0) {
+        show_settings(app);
     } else {
         show_settings(app);
     }
@@ -1573,12 +2051,35 @@ static gboolean poll_keypad(gpointer user_data) {
     last_key = key;
     focused = get_current_focus_widget(app);
 
-    if (focused == app->wifi_pass_entry) {
-        if ((key >= '0' && key <= '9') || key == '*' || key == '#') {
-            wifi_entry_handle_key(app, key);
+    if (GTK_IS_ENTRY(focused)) {
+        if (key == '*') {
+            clear_entry_hash_arm(app);
+            entry_handle_key(app, focused, key);
+            return TRUE;
+        }
+
+        if (key == '#') {
+            entry_commit_pending(app);
+
+            if (app->hash_armed_entry == focused) {
+                clear_entry_hash_arm(app);
+                entry_submit_current(app, focused);
+            } else {
+                clear_entry_hash_arm(app);
+                app->hash_armed_entry = focused;
+                app->hash_arm_timer = g_timeout_add(1400, entry_hash_timeout_cb, app);
+            }
+            return TRUE;
+        }
+
+        if (key >= '0' && key <= '9') {
+            clear_entry_hash_arm(app);
+            entry_handle_key(app, focused, key);
             return TRUE;
         }
     }
+
+    clear_entry_hash_arm(app);
 
     if (key == '2') ui_up(app);
     else if (key == '8') ui_down(app);
@@ -1725,12 +2226,17 @@ static gboolean tick_update_time(gpointer user_data) {
 }
 
 static GtkWidget *build_main_page(App *app) {
-    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-    GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     GtkWidget *title = gtk_label_new(NULL);
     GtkWidget *spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     GtkWidget *btn_settings = make_top_icon_button("emblem-system");
     GtkWidget *btn_power = make_top_icon_button("system-shutdown");
+
+    gtk_widget_set_margin_top(top, 0);
+    gtk_widget_set_margin_bottom(top, 0);
+    gtk_widget_set_margin_start(top, 0);
+    gtk_widget_set_margin_end(top, 0);
 
     gtk_label_set_markup(GTK_LABEL(title), "<span size='xx-large' weight='bold'>Auto Pill Dispenser</span>");
     gtk_label_set_xalign(GTK_LABEL(title), 0.0f);
@@ -1766,13 +2272,30 @@ static GtkWidget *build_main_page(App *app) {
 }
 
 static GtkWidget *build_settings_page(App *app) {
-    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-    GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     GtkWidget *back = gtk_button_new_with_label("← Back");
     GtkWidget *hdr = gtk_label_new(NULL);
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
     GtkWidget *grid = gtk_grid_new();
-    const char *labels[6] = {"Schedules","Time & Date","Wi-Fi Config","Dev: Edit Code","Admin Extract","Admin Reset"};
-    const char *icons[6]  = {"x-office-calendar","preferences-system-time","network-wireless","accessories-text-editor","document-send","edit-clear"};
+    const char *labels[7] = {
+        "Schedules",
+        "Time & Date",
+        "Wi-Fi Config",
+        "Admin Code Manager",
+        "Dev: Edit Code",
+        "Admin Extract",
+        "Admin Reset"
+    };
+    const char *icons[7] = {
+        "x-office-calendar",
+        "preferences-system-time",
+        "network-wireless",
+        "dialog-password",
+        "accessories-text-editor",
+        "document-send",
+        "edit-clear"
+    };
     int i;
 
     g_signal_connect_swapped(back, "clicked", G_CALLBACK(show_main), app);
@@ -1784,19 +2307,35 @@ static GtkWidget *build_settings_page(App *app) {
     gtk_box_pack_start(GTK_BOX(top), hdr, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(root), top, FALSE, FALSE, 0);
 
-    gtk_grid_set_row_spacing(GTK_GRID(grid), 12);
-    gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
-    gtk_box_pack_start(GTK_BOX(root), grid, TRUE, TRUE, 0);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+                                   GTK_POLICY_NEVER,
+                                   GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_vexpand(scroll, TRUE);
+    gtk_box_pack_start(GTK_BOX(root), scroll, TRUE, TRUE, 0);
 
-    for (i = 0; i < 6; i++) {
+    gtk_container_set_border_width(GTK_CONTAINER(grid), 4);
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
+    gtk_grid_set_row_homogeneous(GTK_GRID(grid), TRUE);
+    gtk_grid_set_column_homogeneous(GTK_GRID(grid), TRUE);
+
+    gtk_container_add(GTK_CONTAINER(scroll), grid);
+
+    for (i = 0; i < 7; i++) {
         GtkWidget *btn = gtk_button_new();
-        GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-        GtkWidget *img = gtk_image_new_from_icon_name(icons[i], GTK_ICON_SIZE_DIALOG);
+        GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+        GtkWidget *img = gtk_image_new_from_icon_name(icons[i], GTK_ICON_SIZE_LARGE_TOOLBAR);
         GtkWidget *lbl = gtk_label_new(labels[i]);
 
-        gtk_container_set_border_width(GTK_CONTAINER(box), 14);
+        gtk_container_set_border_width(GTK_CONTAINER(box), 8);
         gtk_label_set_xalign(GTK_LABEL(lbl), 0.5f);
+        gtk_label_set_line_wrap(GTK_LABEL(lbl), TRUE);
+        gtk_label_set_justify(GTK_LABEL(lbl), GTK_JUSTIFY_CENTER);
+
         gtk_widget_set_can_focus(btn, TRUE);
+        gtk_widget_set_hexpand(btn, TRUE);
+        gtk_widget_set_vexpand(btn, TRUE);
+        gtk_widget_set_size_request(btn, 180, 110);
 
         gtk_box_pack_start(GTK_BOX(box), img, TRUE, TRUE, 0);
         gtk_box_pack_start(GTK_BOX(box), lbl, FALSE, FALSE, 0);
@@ -1805,9 +2344,10 @@ static GtkWidget *build_settings_page(App *app) {
         if (i == 0) g_signal_connect_swapped(btn, "clicked", G_CALLBACK(show_schedules), app);
         if (i == 1) g_signal_connect_swapped(btn, "clicked", G_CALLBACK(show_time_date), app);
         if (i == 2) g_signal_connect_swapped(btn, "clicked", G_CALLBACK(show_wifi), app);
-        if (i == 3) g_signal_connect(btn, "clicked", G_CALLBACK(on_dev_edit_clicked), app);
-        if (i == 4) g_signal_connect_swapped(btn, "clicked", G_CALLBACK(show_admin_extract), app);
-        if (i == 5) g_signal_connect(btn, "clicked", G_CALLBACK(on_admin_reset), app);
+        if (i == 3) g_signal_connect_swapped(btn, "clicked", G_CALLBACK(show_admin_code_manager), app);
+        if (i == 4) g_signal_connect(btn, "clicked", G_CALLBACK(on_dev_edit_clicked), app);
+        if (i == 5) g_signal_connect(btn, "clicked", G_CALLBACK(on_request_admin_extract), app);
+        if (i == 6) g_signal_connect(btn, "clicked", G_CALLBACK(on_request_admin_reset), app);
 
         gtk_grid_attach(GTK_GRID(grid), btn, i % 2, i / 2, 1, 1);
     }
@@ -2073,6 +2613,153 @@ static GtkWidget *build_wifi_page(App *app) {
     return root;
 }
 
+static GtkWidget *build_power_page(App *app) {
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    GtkWidget *back = gtk_button_new_with_label("← Back");
+    GtkWidget *hdr = gtk_label_new(NULL);
+    GtkWidget *info;
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    GtkWidget *lbl = gtk_label_new("Admin Code:");
+    GtkWidget *btn = gtk_button_new_with_label("Shutdown");
+
+    g_signal_connect_swapped(back, "clicked", G_CALLBACK(show_main), app);
+    g_signal_connect(btn, "clicked", G_CALLBACK(on_power_shutdown), app);
+
+    gtk_label_set_markup(GTK_LABEL(hdr), "<span size='x-large' weight='bold'>Shutdown</span>");
+    gtk_label_set_xalign(GTK_LABEL(hdr), 0.0f);
+
+    gtk_box_pack_start(GTK_BOX(top), back, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(top), hdr, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(root), top, FALSE, FALSE, 0);
+
+    info = gtk_label_new("Enter the admin code to shut down the Raspberry Pi.\nKeypad users: press # twice to submit.");
+    gtk_label_set_xalign(GTK_LABEL(info), 0.0f);
+    gtk_label_set_line_wrap(GTK_LABEL(info), TRUE);
+    gtk_box_pack_start(GTK_BOX(root), info, FALSE, FALSE, 0);
+
+    gtk_label_set_xalign(GTK_LABEL(lbl), 0.0f);
+
+    app->power_code_entry = gtk_entry_new();
+    gtk_entry_set_visibility(GTK_ENTRY(app->power_code_entry), TRUE);
+    gtk_widget_set_hexpand(app->power_code_entry, TRUE);
+    gtk_widget_set_can_focus(app->power_code_entry, TRUE);
+
+    gtk_box_pack_start(GTK_BOX(row), lbl, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), app->power_code_entry, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(row), btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(root), row, FALSE, FALSE, 0);
+
+    app->power_status_label = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(app->power_status_label), 0.0f);
+    gtk_box_pack_start(GTK_BOX(root), app->power_status_label, FALSE, FALSE, 0);
+
+    return root;
+}
+
+static GtkWidget *build_admin_code_manager_page(App *app) {
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    GtkWidget *back = gtk_button_new_with_label("← Back");
+    GtkWidget *hdr = gtk_label_new(NULL);
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    GtkWidget *lbl = gtk_label_new("Code:");
+    GtkWidget *info;
+
+    g_signal_connect_swapped(back, "clicked", G_CALLBACK(show_settings), app);
+
+    gtk_label_set_markup(GTK_LABEL(hdr), "<span size='x-large' weight='bold'>Admin Code Manager</span>");
+    gtk_label_set_xalign(GTK_LABEL(hdr), 0.0f);
+
+    gtk_box_pack_start(GTK_BOX(top), back, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(top), hdr, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(root), top, FALSE, FALSE, 0);
+
+    app->admin_code_current_label = gtk_label_new("Current admin code: Not set");
+    gtk_label_set_xalign(GTK_LABEL(app->admin_code_current_label), 0.0f);
+    gtk_box_pack_start(GTK_BOX(root), app->admin_code_current_label, FALSE, FALSE, 0);
+
+    info = gtk_label_new("Use this page to create or change the admin code used for shutdown.\nKeypad users: press # twice to continue/save.");
+    gtk_label_set_xalign(GTK_LABEL(info), 0.0f);
+    gtk_label_set_line_wrap(GTK_LABEL(info), TRUE);
+    gtk_box_pack_start(GTK_BOX(root), info, FALSE, FALSE, 0);
+
+    app->admin_code_prompt_label = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(app->admin_code_prompt_label), 0.0f);
+    gtk_label_set_line_wrap(GTK_LABEL(app->admin_code_prompt_label), TRUE);
+    gtk_box_pack_start(GTK_BOX(root), app->admin_code_prompt_label, FALSE, FALSE, 0);
+
+    gtk_label_set_xalign(GTK_LABEL(lbl), 0.0f);
+
+    app->admin_code_entry = gtk_entry_new();
+    gtk_entry_set_visibility(GTK_ENTRY(app->admin_code_entry), TRUE);
+    gtk_widget_set_hexpand(app->admin_code_entry, TRUE);
+    gtk_widget_set_can_focus(app->admin_code_entry, TRUE);
+
+    app->admin_code_action_button = gtk_button_new_with_label("Continue");
+    g_signal_connect(app->admin_code_action_button, "clicked", G_CALLBACK(on_admin_code_action), app);
+
+    gtk_box_pack_start(GTK_BOX(row), lbl, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), app->admin_code_entry, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(row), app->admin_code_action_button, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(root), row, FALSE, FALSE, 0);
+
+    app->admin_code_status_label = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(app->admin_code_status_label), 0.0f);
+    gtk_box_pack_start(GTK_BOX(root), app->admin_code_status_label, FALSE, FALSE, 0);
+
+    return root;
+}
+
+static GtkWidget *build_admin_gate_page(App *app) {
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    GtkWidget *back = gtk_button_new_with_label("← Back");
+    GtkWidget *hdr = gtk_label_new(NULL);
+    GtkWidget *info;
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    GtkWidget *lbl = gtk_label_new("Admin Code:");
+    GtkWidget *btn = gtk_button_new_with_label("Continue");
+
+    g_signal_connect_swapped(back, "clicked", G_CALLBACK(show_settings), app);
+    g_signal_connect(btn, "clicked", G_CALLBACK(on_admin_gate_continue), app);
+
+    gtk_label_set_markup(GTK_LABEL(hdr), "<span size='x-large' weight='bold'>Admin Verification</span>");
+    gtk_label_set_xalign(GTK_LABEL(hdr), 0.0f);
+
+    gtk_box_pack_start(GTK_BOX(top), back, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(top), hdr, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(root), top, FALSE, FALSE, 0);
+
+    info = gtk_label_new("Enter the admin code to continue.\nKeypad users: press # twice to submit.");
+    gtk_label_set_xalign(GTK_LABEL(info), 0.0f);
+    gtk_label_set_line_wrap(GTK_LABEL(info), TRUE);
+    gtk_box_pack_start(GTK_BOX(root), info, FALSE, FALSE, 0);
+
+    app->admin_gate_prompt_label = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(app->admin_gate_prompt_label), 0.0f);
+    gtk_label_set_line_wrap(GTK_LABEL(app->admin_gate_prompt_label), TRUE);
+    gtk_box_pack_start(GTK_BOX(root), app->admin_gate_prompt_label, FALSE, FALSE, 0);
+
+    gtk_label_set_xalign(GTK_LABEL(lbl), 0.0f);
+
+    app->admin_gate_entry = gtk_entry_new();
+    gtk_entry_set_visibility(GTK_ENTRY(app->admin_gate_entry), TRUE);
+    gtk_widget_set_hexpand(app->admin_gate_entry, TRUE);
+    gtk_widget_set_can_focus(app->admin_gate_entry, TRUE);
+
+    gtk_box_pack_start(GTK_BOX(row), lbl, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), app->admin_gate_entry, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(row), btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(root), row, FALSE, FALSE, 0);
+
+    app->admin_gate_status_label = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(app->admin_gate_status_label), 0.0f);
+    gtk_box_pack_start(GTK_BOX(root), app->admin_gate_status_label, FALSE, FALSE, 0);
+
+    return root;
+}
+
 static GtkWidget *build_admin_extract_page(App *app) {
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
     GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
@@ -2136,24 +2823,42 @@ int main(int argc, char **argv) {
 
     app.wifi_selected_ssid[0] = 0;
     app.usb_selected_mount[0] = 0;
+    app.admin_code[0] = 0;
+    app.admin_code_temp[0] = 0;
+    app.admin_gate_target = ADMIN_GATE_NONE;
     app.focus_count = 0;
     app.focus_index = 0;
     app.active_modal = NULL;
     app.pending_digit = 0;
     app.pending_index = 0;
     app.pending_commit_timer = 0;
+    app.pending_entry = NULL;
+    app.hash_arm_timer = 0;
+    app.hash_armed_entry = NULL;
 
     gtk_init(&argc, &argv);
     load_css();
 
     set_default_schedules(&app);
     load_schedules(&app);
+    load_admin_code(&app);
 
     app.window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(app.window), "Auto Pill Dispenser");
-    gtk_window_set_default_size(GTK_WINDOW(app.window), 980, 680);
-    gtk_window_fullscreen(GTK_WINDOW(app.window));
-    gtk_container_set_border_width(GTK_CONTAINER(app.window), 16);
+
+    {
+        GdkScreen *screen = gdk_screen_get_default();
+        gint mon = gdk_screen_get_primary_monitor(screen);
+        GdkRectangle geo;
+
+        gdk_screen_get_monitor_geometry(screen, mon, &geo);
+
+        gtk_window_set_default_size(GTK_WINDOW(app.window), geo.width, geo.height);
+        gtk_window_move(GTK_WINDOW(app.window), geo.x, geo.y);
+    }
+
+    gtk_window_maximize(GTK_WINDOW(app.window));
+    gtk_container_set_border_width(GTK_CONTAINER(app.window), 4);
     g_signal_connect(app.window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
 
     app.stack = gtk_stack_new();
@@ -2166,11 +2871,15 @@ int main(int argc, char **argv) {
     gtk_stack_add_named(GTK_STACK(app.stack), build_schedules_page(&app), "schedules");
     gtk_stack_add_named(GTK_STACK(app.stack), build_time_date_page(&app), "time_date");
     gtk_stack_add_named(GTK_STACK(app.stack), build_wifi_page(&app), "wifi");
+    gtk_stack_add_named(GTK_STACK(app.stack), build_power_page(&app), "power_admin");
+    gtk_stack_add_named(GTK_STACK(app.stack), build_admin_code_manager_page(&app), "admin_code_manager");
+    gtk_stack_add_named(GTK_STACK(app.stack), build_admin_gate_page(&app), "admin_gate");
     gtk_stack_add_named(GTK_STACK(app.stack), build_admin_extract_page(&app), "admin_extract");
 
     show_main(&app);
     rebuild_today_schedule(&app);
     fill_schedule_spins_from_data(&app);
+    reset_admin_code_manager_ui(&app);
 
     gpio_setup_outputs();
 
