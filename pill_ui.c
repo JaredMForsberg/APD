@@ -15,8 +15,8 @@
 #define MAX_FOCUS_WIDGETS 310
 
 static const char *DAYS[7] = {"Mon","Tue","Wed","Thu","Fri","Sat","Sun"};
-static int motor_pins[16] = {17, 27, 22, 5, 6, 13, 19, 26, 18, 23, 24, 25, 12, 16, 20, 21};
-
+static int motor_pins[8] = {17, 27, 22, 5, 6, 13, 19, 26};
+//blue, yellow, red, black, green, yellow w/ strip, green w/ strip, blue w/ strip
 static int keypad_cols[3] = {2, 3, 4};
 static int keypad_rows[4] = {14, 15, 8, 7};
 
@@ -1176,7 +1176,7 @@ static void gpio_setup_outputs(void) {
     char cmd[128];
     int i;
 
-    for (i = 0; i < 16; i++) {
+    for (i = 0; i < 8; i++) {
         snprintf(cmd, sizeof(cmd), "raspi-gpio set %d op dl", motor_pins[i]);
         system(cmd);
     }
@@ -1200,78 +1200,54 @@ static void gpio_write(int pin, int value) {
 
 static void dispense(int slot) {
     if (slot == 1) {
-        gpio_write(motor_pins[4], 0);
-        gpio_write(motor_pins[5], 0);
-        gpio_write(motor_pins[6], 1);
+        gpio_write(motor_pins[2], 0);
+        gpio_write(motor_pins[3], 1);
+        usleep(1000000);
+
+        gpio_write(motor_pins[3], 0);
+
+        gpio_write(motor_pins[1], 0);
+        gpio_write(motor_pins[0], 1);
+        usleep(1000000);
+
+        gpio_write(motor_pins[0], 0);
+
+        gpio_write(motor_pins[1], 1);
+        gpio_write(motor_pins[0], 0);
+        usleep(1000000);
+
+        gpio_write(motor_pins[1], 0);
+
+        gpio_write(motor_pins[2], 1);
+        gpio_write(motor_pins[3], 0);
+        usleep(1000000);
+
+        gpio_write(motor_pins[2], 0);
+
+    } else if (slot == 2) {
+        gpio_write(motor_pins[6], 0);
         gpio_write(motor_pins[7], 1);
         usleep(1000000);
 
-        gpio_write(motor_pins[6], 0);
         gpio_write(motor_pins[7], 0);
 
-        gpio_write(motor_pins[3], 0);
-        gpio_write(motor_pins[2], 0);
-        gpio_write(motor_pins[0], 1);
-        gpio_write(motor_pins[1], 1);
-        usleep(1000000);
-
-        gpio_write(motor_pins[0], 0);
-        gpio_write(motor_pins[1], 0);
-
-        gpio_write(motor_pins[3], 1);
-        gpio_write(motor_pins[2], 1);
-        gpio_write(motor_pins[0], 0);
-        gpio_write(motor_pins[1], 0);
-        usleep(1000000);
-
-        gpio_write(motor_pins[3], 0);
-        gpio_write(motor_pins[2], 0);
-
+        gpio_write(motor_pins[5], 0);
         gpio_write(motor_pins[4], 1);
-        gpio_write(motor_pins[5], 1);
-        gpio_write(motor_pins[6], 0);
-        gpio_write(motor_pins[7], 0);
         usleep(1000000);
 
         gpio_write(motor_pins[4], 0);
+
+        gpio_write(motor_pins[5], 1);
+        gpio_write(motor_pins[4], 0);
+        usleep(1000000);
+
         gpio_write(motor_pins[5], 0);
 
-    } else if (slot == 2) {
-        gpio_write(motor_pins[12], 0);
-        gpio_write(motor_pins[13], 0);
-        gpio_write(motor_pins[14], 1);
-        gpio_write(motor_pins[15], 1);
+        gpio_write(motor_pins[6], 1);
+        gpio_write(motor_pins[7], 0);
         usleep(1000000);
 
-        gpio_write(motor_pins[14], 0);
-        gpio_write(motor_pins[15], 0);
-
-        gpio_write(motor_pins[11], 0);
-        gpio_write(motor_pins[10], 0);
-        gpio_write(motor_pins[8], 1);
-        gpio_write(motor_pins[9], 1);
-        usleep(1000000);
-
-        gpio_write(motor_pins[8], 0);
-        gpio_write(motor_pins[9], 0);
-
-        gpio_write(motor_pins[11], 1);
-        gpio_write(motor_pins[10], 1);
-        gpio_write(motor_pins[8], 0);
-        gpio_write(motor_pins[9], 0);
-        usleep(1000000);
-
-        gpio_write(motor_pins[11], 0);
-        gpio_write(motor_pins[10], 0);
-
-        gpio_write(motor_pins[12], 1);
-        gpio_write(motor_pins[13], 1);
-        gpio_write(motor_pins[14], 0);
-        gpio_write(motor_pins[15], 0);
-        usleep(1000000);
-
-        gpio_write(motor_pins[12], 0);
-        gpio_write(motor_pins[13], 0);
+        gpio_write(motor_pins[6], 0);
     }
 }
 
@@ -1486,15 +1462,15 @@ static void tree_move_selection(GtkWidget *tree, int dir) {
 
 static void ui_right(App *app) {
     if (!app || app->focus_count == 0) return;
-    app->focus_index++;
-    if (app->focus_index >= app->focus_count) app->focus_index = 0;
+    app->focus_index--;
+    if (app->focus_index < 0) app->focus_index = app->focus_count - 1;
     gtk_widget_grab_focus(app->focused_widget[app->focus_index]);
 }
 
 static void ui_left(App *app) {
     if (!app || app->focus_count == 0) return;
-    app->focus_index--;
-    if (app->focus_index < 0) app->focus_index = app->focus_count - 1;
+    app->focus_index++;
+    if (app->focus_index >= app->focus_count) app->focus_index = 0;
     gtk_widget_grab_focus(app->focused_widget[app->focus_index]);
 }
 
