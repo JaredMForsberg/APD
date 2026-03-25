@@ -16,7 +16,7 @@
 #define MAX_FOCUS_WIDGETS 310
 
 static const char *DAYS[7] = {"Mon","Tue","Wed","Thu","Fri","Sat","Sun"};
-static int motor_pins[8] = {17, 27, 22, 5, 6, 13, 19, 26}; //only need 4 now
+static int motor_pins[4] = {17, 27, 22, 5}; //only need 4 now//6, 13, 19, 26 have wires, but are unused
 /* blue, yellow, red, black, green, yellow w/ stripe, green w/ stripe, blue w/ stripe */
 static int keypad_cols[3] = {2, 3, 4};
 static int keypad_rows[4] = {14, 15, 8, 7};
@@ -1616,7 +1616,7 @@ static void gpio_setup_outputs(void) {
     char cmd[128];
     int i;
 
-    for (i = 0; i < 8; i++) { //only need 4 now
+    for (i = 0; i < 4; i++) { 
         snprintf(cmd, sizeof(cmd), "raspi-gpio set %d op dl", motor_pins[i]);
         system(cmd);
     }
@@ -2411,9 +2411,9 @@ static GtkWidget *build_settings_page(App *app) {
     g_signal_connect(btn_test_start, "clicked", G_CALLBACK(on_test_start), app);
     g_signal_connect(btn_test_stop,  "clicked", G_CALLBACK(on_test_stop), app);
 
-    // Row 3 since rows 0–2 are already used by the 6 buttons  
-    gtk_grid_attach(GTK_GRID(grid), btn_test_start, 0, 3, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), btn_test_stop,  1, 3, 1, 1);
+    // Row 5 since rows 0–4 are already used by the 7 buttons, will be leaving a blank space.  
+    gtk_grid_attach(GTK_GRID(grid), btn_test_start, 0, 4, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), btn_test_stop,  0, 4, 1, 1);
 
 
 
