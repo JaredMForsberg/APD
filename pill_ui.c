@@ -16,7 +16,7 @@
 #define MAX_FOCUS_WIDGETS 310
 
 static const char *DAYS[7] = {"Mon","Tue","Wed","Thu","Fri","Sat","Sun"};
-static int motor_pins[8] = {17, 27, 22, 5, 6, 13, 19, 26};
+static int motor_pins[8] = {17, 27, 22, 5, 6, 13, 19, 26}; //only need 4 now
 /* blue, yellow, red, black, green, yellow w/ stripe, green w/ stripe, blue w/ stripe */
 static int keypad_cols[3] = {2, 3, 4};
 static int keypad_rows[4] = {14, 15, 8, 7};
@@ -104,6 +104,12 @@ typedef struct {
 
     guint hash_arm_timer;
     GtkWidget *hash_armed_entry;
+
+    GtkWidget *test_status_label;
+    guint test_timer_id;
+    int test_running;
+    int test_count;
+
 } App;
 
 typedef struct {
@@ -1610,7 +1616,7 @@ static void gpio_setup_outputs(void) {
     char cmd[128];
     int i;
 
-    for (i = 0; i < 8; i++) {
+    for (i = 0; i < 8; i++) { //only need 4 now
         snprintf(cmd, sizeof(cmd), "raspi-gpio set %d op dl", motor_pins[i]);
         system(cmd);
     }
@@ -1634,54 +1640,31 @@ static void gpio_write(int pin, int value) {
 
 static void dispense(int slot) {
     if (slot == 1) {
-        gpio_write(motor_pins[2], 0);
-        gpio_write(motor_pins[3], 1);
-        usleep(1000000);
-
-        gpio_write(motor_pins[3], 0);
-
-        gpio_write(motor_pins[1], 0);
+        gpio_write(motor_pins[1], 0);//forward
         gpio_write(motor_pins[0], 1);
         usleep(1000000);
 
         gpio_write(motor_pins[0], 0);
 
-        gpio_write(motor_pins[1], 1);
+        gpio_write(motor_pins[1], 1);//reverse
         gpio_write(motor_pins[0], 0);
         usleep(1000000);
 
-        gpio_write(motor_pins[1], 0);
+        gpio_write(motor_pins[1], 0);//off
 
+    } else if (slot == 2) {
+
+        gpio_write(motor_pins[3], 0);//forward
         gpio_write(motor_pins[2], 1);
-        gpio_write(motor_pins[3], 0);
         usleep(1000000);
 
         gpio_write(motor_pins[2], 0);
 
-    } else if (slot == 2) {
-        gpio_write(motor_pins[6], 0);
-        gpio_write(motor_pins[7], 1);
+        gpio_write(motor_pins[3], 1);//reverse
+        gpio_write(motor_pins[2], 0);
         usleep(1000000);
 
-        gpio_write(motor_pins[7], 0);
-
-        gpio_write(motor_pins[5], 0);
-        gpio_write(motor_pins[4], 1);
-        usleep(1000000);
-
-        gpio_write(motor_pins[4], 0);
-
-        gpio_write(motor_pins[5], 1);
-        gpio_write(motor_pins[4], 0);
-        usleep(1000000);
-
-        gpio_write(motor_pins[5], 0);
-
-        gpio_write(motor_pins[6], 1);
-        gpio_write(motor_pins[7], 0);
-        usleep(1000000);
-
-        gpio_write(motor_pins[6], 0);
+        gpio_write(motor_pins[3], 0);//off
     }
 }
 
@@ -2152,6 +2135,69 @@ static void load_css(void) {
     g_object_unref(provider);
 }
 
+//for test case
+static gboolean test_dispense_callback(gpointer user_data) {
+    App *app = (App *)user_data;
+    char msg[100];
+
+    if (!app->test_running)
+        return FALSE;
+    if(app->test_count < 100) {
+        dispense(1);
+    } else if (app->test_count < 200) {
+        dispense(2);
+    } else {
+        app->test_running = 0;
+        app->test_timer_id = 0;
+        ui_set_status(app->test_status_label, "Test Complete.");
+        return FALSE;
+    }
+    snprintf(msg, sizeof(msg), "Test running: %d / 200", app->test_count + 1);
+    ui_set_status(app->test_status_label, msg);
+    app->test_count++;
+    return TRUE;
+}
+
+//handlers for the buttons for the test.
+static void on_test_start(GtkWidget *w, gpointer user_data) {
+    App *app = (App *)user_data;
+
+    (void)w;
+
+    if (app->test_running) {
+        ui_set_status(app->test_status_label, "Test already running.");
+        return;
+    }
+
+    app->test_running = 1;
+    app->test_count = 0;
+
+    ui_set_status(app->test_status_label, "Test started.");
+
+    app->test_timer_id = g_timeout_add_seconds(30, test_dispense_callback, app);
+}
+
+static void on_test_stop(GtkWidget *w, gpointer user_data) {
+    App *app = (App *)user_data;
+
+    (void)w;
+
+    if (!app->test_running) {
+        ui_set_status(app->test_status_label, "Test not running.");
+        return;
+    }
+
+    app->test_running = 0;
+
+    if (app->test_timer_id) {
+        g_source_remove(app->test_timer_id);
+        app->test_timer_id = 0;
+    }
+
+    ui_set_status(app->test_status_label, "Test stopped.");
+}
+
+
 static gboolean schedule_file_changed(time_t *last_mtime_out) {
     char path[512];
     struct stat st;
@@ -2351,6 +2397,25 @@ static GtkWidget *build_settings_page(App *app) {
 
         gtk_grid_attach(GTK_GRID(grid), btn, i % 2, i / 2, 1, 1);
     }
+
+    app->test_status_label = gtk_label_new("Test not running");
+    gtk_label_set_xalign(GTK_LABEL(app->test_status_label), 0.0f);
+    gtk_box_pack_start(GTK_BOX(root), app->test_status_label, FALSE, FALSE, 0);
+
+    GtkWidget *btn_test_start = gtk_button_new_with_label("Test: Start Dispense");
+    GtkWidget *btn_test_stop  = gtk_button_new_with_label("Test: Stop");
+
+    gtk_widget_set_can_focus(btn_test_start, TRUE);
+    gtk_widget_set_can_focus(btn_test_stop, TRUE);
+
+    g_signal_connect(btn_test_start, "clicked", G_CALLBACK(on_test_start), app);
+    g_signal_connect(btn_test_stop,  "clicked", G_CALLBACK(on_test_stop), app);
+
+    // Row 3 since rows 0–2 are already used by the 6 buttons  
+    gtk_grid_attach(GTK_GRID(grid), btn_test_start, 0, 3, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), btn_test_stop,  1, 3, 1, 1);
+
+
 
     return root;
 }
@@ -2835,6 +2900,9 @@ int main(int argc, char **argv) {
     app.pending_entry = NULL;
     app.hash_arm_timer = 0;
     app.hash_armed_entry = NULL;
+    app.test_timer_id = 0;
+    app.test_running = 0;
+    app.test_count = 0;
 
     gtk_init(&argc, &argv);
     load_css();
