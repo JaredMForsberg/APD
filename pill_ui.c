@@ -1,3 +1,19 @@
+/******************************************************************************
+ * Automatic Pill Dispenser - Main UI and Control Module
+ *
+ * This file contains the primary GTK-based user interface and control logic
+ * for the Automatic Pill Dispenser (APD). It manages:
+ *   - daily pill schedules for two dispense slots
+ *   - Raspberry Pi GPIO-based motor control
+ *   - keypad-based navigation and text entry
+ *   - Wi-Fi configuration through NetworkManager (nmcli)
+ *   - admin code protection for shutdown and admin actions
+ *   - export/reset/admin logging functions
+ *
+ * The program stores schedule data, admin logs, and admin code values in
+ * local files and continuously checks the current time to trigger dispense
+ * events when scheduled.
+ ******************************************************************************/
 #define _GNU_SOURCE
 #include <gtk/gtk.h>
 #include <stdlib.h>
@@ -8,6 +24,7 @@
 #include <stdio.h>
 #include <unistd.h>
 
+/* File paths, storage names, and UI/application limits. */
 #define DEV_FILE_PATH   "/home/autopilldispense/Desktop/pill_ui.c"
 #define SCHEDULE_FILE   ".pill_dispenser_schedule.txt"
 #define ADMIN_LOG_PATH  "/home/autopilldispense/Desktop/admin.txt"
@@ -15,7 +32,20 @@
 #define MAX_TIMES       10
 #define MAX_FOCUS_WIDGETS 310
 
+/* Monday-first day labels used for schedule storage and display. */
 static const char *DAYS[7] = {"Mon","Tue","Wed","Thu","Fri","Sat","Sun"};
+/******************************************************************************
+ * Hardware pin mappings
+ *
+ * motor_pins:
+ *   GPIO outputs used to drive the two pill-slot motors.
+ *
+ * keypad_cols / keypad_rows:
+ *   GPIO lines used for scanning the 4x3 matrix keypad.
+ *
+ * keypad_map:
+ *   Logical character mapping for each keypad row/column position.
+ ******************************************************************************/
 static int motor_pins[4] = {17, 27, 22, 5}; //only need 4 now//6, 13, 19, 26 have wires, but are unused
 /* blue, yellow, red, black, green, yellow w/ stripe, green w/ stripe, blue w/ stripe */
 static int keypad_cols[3] = {2, 3, 4};
@@ -42,7 +72,7 @@ typedef struct {
     GtkWidget *today_sched_title;
     GtkWidget *today_sched_box;
     GtkWidget *today_empty_label;
-
+/* Stores one dispense time entry: hour, minute, and enabled state. */
     HM slot_times[7][2][MAX_TIMES];
     int visible_count[7][2];
 
@@ -112,12 +142,31 @@ typedef struct {
 
 } App;
 
+/******************************************************************************
+ * Main application state container.
+ *
+ * Holds:
+ *   - top-level GTK widgets and page references
+ *   - schedule data and schedule editor widgets
+ *   - time/date page widgets
+ *   - Wi-Fi page widgets and selected network state
+ *   - admin page widgets, code state, and protected action state
+ *   - keypad focus/navigation state
+ *   - modal dialog state
+ *   - keypad multi-tap text entry state
+ *   - test/diagnostic mode state
+ *
+ * This struct is shared across callbacks so the UI and control logic can
+ * operate on the same live application state.
+ ******************************************************************************/
 typedef struct {
     App *app;
     int day;
     int slot;
+/* Callback helper context for identifying a specific day/slot editor pair. */
 } DaySlotRef;
 
+/* Identifies which protected admin action is being requested. */
 enum {
     ADMIN_GATE_NONE = 0,
     ADMIN_GATE_EXTRACT = 1,
@@ -145,6 +194,12 @@ static void on_request_admin_reset(GtkWidget *w, gpointer user_data);
 static void reset_admin_code_manager_ui(App *app);
 static GtkWidget *build_admin_gate_page(App *app);
 
+/******************************************************************************
+ * General utility helpers
+ *
+ * Small helper functions for string cleanup, time formatting, label updates,
+ * page switching, and shared UI behavior.
+ ******************************************************************************/
 static void trim(char *s) {
     if (!s) return;
     size_t len = strlen(s);
@@ -193,6 +248,7 @@ static void show_page(App *app, const char *name) {
 static void show_main(App *app)     { show_page(app, "main"); }
 static void show_settings(App *app) { show_page(app, "settings"); }
 
+/* Convert tm_wday from Sunday-first (0=Sun) to Monday-first (0=Mon). */
 static int get_today_index(void) {
     time_t now = time(NULL);
     struct tm *lt = localtime(&now);
@@ -200,6 +256,7 @@ static int get_today_index(void) {
     return (lt->tm_wday + 6) % 7;
 }
 
+/* Creates a compact icon-only button for the top navigation bar. */
 static GtkWidget *make_top_icon_button(const char *icon_name) {
     GtkWidget *btn = gtk_button_new();
     GtkWidget *img = gtk_image_new_from_icon_name(icon_name, GTK_ICON_SIZE_BUTTON);
@@ -213,6 +270,7 @@ static GtkWidget *make_top_icon_button(const char *icon_name) {
     return btn;
 }
 
+/* Creates a numeric spin button with the requested range and step size. */
 static GtkWidget *make_spin(int min, int max, int step) {
     GtkAdjustment *adj = gtk_adjustment_new(min, min, max, step, 10, 0);
     GtkWidget *spin = gtk_spin_button_new(adj, 1, 0);
@@ -221,6 +279,12 @@ static GtkWidget *make_spin(int min, int max, int step) {
     return spin;
 }
 
+/******************************************************************************
+ * Comparator used to sort schedule entries.
+ *
+ * Enabled times are sorted before disabled entries. Enabled entries are then
+ * sorted in ascending order by total minutes from midnight.
+ ******************************************************************************/
 static int time_compare(const void *a, const void *b) {
     const HM *ta = (const HM *)a;
     const HM *tb = (const HM *)b;
@@ -236,10 +300,12 @@ static int time_compare(const void *a, const void *b) {
     }
 }
 
+/* Sorts one day's time entries for a single pill slot. */
 static void sort_slot_times(App *app, int day, int slot) {
     qsort(app->slot_times[day][slot], MAX_TIMES, sizeof(HM), time_compare);
 }
 
+/* Recalculates the number of enabled time rows for each day and slot. */
 static void update_visible_count_from_data(App *app) {
     int d, s, i;
     for (d = 0; d < 7; d++) {
@@ -253,6 +319,7 @@ static void update_visible_count_from_data(App *app) {
     }
 }
 
+/* Resets all schedules to default empty values. */
 static void set_default_schedules(App *app) {
     int d, s, i;
     for (d = 0; d < 7; d++) {
@@ -267,17 +334,20 @@ static void set_default_schedules(App *app) {
     }
 }
 
+/* Builds the full path to the saved schedule file in the user's home directory. */
 static void get_schedule_path(char *out, size_t outsz) {
     const char *home = getenv("HOME");
     if (!home) home = "/home/pi";
     snprintf(out, outsz, "%s/%s", home, SCHEDULE_FILE);
 }
 
+/* Builds the full path to the saved admin code file in the user's home directory. */
 static void get_admin_code_path(char *out, size_t outsz) {
     const char *home = getenv("HOME");
     if (!home) home = "/home/pi";
     snprintf(out, outsz, "%s/%s", home, ADMIN_CODE_FILE);
 }
+
 
 static int admin_code_is_set(App *app) {
     return (app->admin_code[0] != '\0');
@@ -288,6 +358,11 @@ static int admin_code_matches(App *app, const char *entered) {
     return strcmp(app->admin_code, entered) == 0;
 }
 
+/******************************************************************************
+ * Saves the current admin code to disk and updates the in-memory copy.
+ *
+ * Returns 1 on success, 0 on failure.
+ ******************************************************************************/
 static int save_admin_code_value(App *app, const char *code) {
     char path[512];
     FILE *f;
@@ -304,6 +379,7 @@ static int save_admin_code_value(App *app, const char *code) {
     return 1;
 }
 
+/* Loads the admin code from disk into app state, if one exists. */
 static int load_admin_code(App *app) {
     char path[512];
     FILE *f;
@@ -329,6 +405,12 @@ static int clear_admin_code_value(App *app) {
     return save_admin_code_value(app, "");
 }
 
+/******************************************************************************
+ * Writes the full weekly schedule to disk using the current multi-slot format.
+ *
+ * Each day stores up to MAX_TIMES entries for slot 1 and slot 2.
+ * Returns 1 on success, 0 on failure.
+ ******************************************************************************/
 static int save_schedules(App *app) {
     char path[512];
     FILE *f;
@@ -414,6 +496,12 @@ static int load_new_schedule_format(App *app, const char *line_in) {
     return 1;
 }
 
+/******************************************************************************
+ * Parses one line of the older two-time schedule format for backward
+ * compatibility with previously saved schedule files.
+ *
+ * Returns 1 if the line was parsed successfully, otherwise 0.
+ ******************************************************************************/
 static int load_old_schedule_format(App *app, const char *line_in) {
     char day[16];
     int h1, m1, h2, m2;
@@ -455,6 +543,14 @@ static int load_old_schedule_format(App *app, const char *line_in) {
     return 1;
 }
 
+/******************************************************************************
+ * Loads schedule data from disk.
+ *
+ * Supports both the current multi-entry format and an older legacy format.
+ * After loading, entries are sorted and visible row counts are recalculated.
+ *
+ * Returns 1 if at least one valid schedule line was loaded, otherwise 0.
+ ******************************************************************************/
 static int load_schedules(App *app) {
     char path[512];
     FILE *f;
@@ -488,6 +584,12 @@ static int load_schedules(App *app) {
     return (seen > 0);
 }
 
+/******************************************************************************
+ * Rebuilds the "Today's Schedule" display on the main page.
+ *
+ * This function clears the existing GTK widgets in the display area and
+ * recreates them from the currently loaded schedule data for the current day.
+ ******************************************************************************/
 static void rebuild_today_schedule(App *app) {
     GList *children;
     GList *l;
@@ -563,6 +665,11 @@ static void rebuild_today_schedule(App *app) {
     gtk_widget_show_all(app->today_sched_box);
 }
 
+/******************************************************************************
+ * Appends a full schedule snapshot to the admin log file.
+ *
+ * Used to record schedule saves, resets, and other admin-visible changes.
+ ******************************************************************************/
 static void admin_log_append_snapshot(App *app, const char *reason) {
     FILE *f = fopen(ADMIN_LOG_PATH, "a");
     int d, i;
@@ -590,6 +697,7 @@ static void admin_log_append_snapshot(App *app, const char *reason) {
     fclose(f);
 }
 
+/* Clears the admin log file contents. */
 static int admin_log_clear(void) {
     FILE *f = fopen(ADMIN_LOG_PATH, "w");
     if (!f) return 0;
@@ -597,6 +705,14 @@ static int admin_log_clear(void) {
     return 1;
 }
 
+/******************************************************************************
+ * Shows a modal confirmation dialog that is compatible with keypad navigation.
+ *
+ * While the dialog is active, focus management is temporarily redirected so
+ * the keypad can move between dialog buttons and confirm/cancel actions.
+ *
+ * Returns the GTK dialog response code.
+ ******************************************************************************/
 static int run_keypad_dialog(App *app,
                              const char *title,
                              const char *primary,
@@ -682,6 +798,7 @@ static int run_keypad_dialog(App *app,
     return resp;
 }
 
+/* Shows a simple keypad-friendly informational dialog. */
 static void run_info_dialog(App *app,
                             const char *title,
                             const char *primary,
@@ -696,6 +813,12 @@ static void on_power_clicked(GtkWidget *w, gpointer user_data) {
     show_power_admin(app);
 }
 
+/******************************************************************************
+ * Minimizes the current UI and opens the development source file in Geany.
+ *
+ * Intended as a development/debug shortcut rather than a normal end-user
+ * feature.
+ ******************************************************************************/
 static void on_dev_edit_clicked(GtkWidget *w, gpointer user_data) {
     App *app = (App *)user_data;
     char cmd[512];
@@ -709,6 +832,7 @@ static void on_dev_edit_clicked(GtkWidget *w, gpointer user_data) {
     system(cmd);
 }
 
+/* Shows or hides schedule editor rows based on the active row count. */
 static void refresh_schedule_day_slot_visibility(App *app, int day, int slot) {
     int visible = app->visible_count[day][slot];
     int i;
@@ -733,6 +857,7 @@ static void refresh_all_schedule_visibility(App *app) {
     }
 }
 
+/* Adds a new visible schedule row to the selected day/slot editor. */
 static void on_slot_add_clicked(GtkWidget *w, gpointer user_data) {
     DaySlotRef *ref = (DaySlotRef *)user_data;
     App *app = ref->app;
@@ -751,6 +876,7 @@ static void on_slot_add_clicked(GtkWidget *w, gpointer user_data) {
     refresh_focus_for_current_page(app);
 }
 
+/* Removes the last visible schedule row from the selected day/slot editor. */
 static void on_slot_remove_clicked(GtkWidget *w, gpointer user_data) {
     DaySlotRef *ref = (DaySlotRef *)user_data;
     App *app = ref->app;
@@ -769,6 +895,7 @@ static void on_slot_remove_clicked(GtkWidget *w, gpointer user_data) {
     refresh_focus_for_current_page(app);
 }
 
+/* Pushes in-memory schedule values into the visible schedule spin buttons. */
 static void fill_schedule_spins_from_data(App *app) {
     int d, s, i;
     for (d = 0; d < 7; d++) {
@@ -788,6 +915,12 @@ static void fill_schedule_spins_from_data(App *app) {
     refresh_all_schedule_visibility(app);
 }
 
+/******************************************************************************
+ * Pulls edited schedule values out of the GTK spin buttons and writes them
+ * back into the in-memory schedule arrays.
+ *
+ * Visible rows become enabled entries; hidden rows become disabled entries.
+ ******************************************************************************/
 static void pull_schedule_data_from_spins(App *app) {
     int d, s, i;
     for (d = 0; d < 7; d++) {
@@ -805,6 +938,10 @@ static void pull_schedule_data_from_spins(App *app) {
     update_visible_count_from_data(app);
 }
 
+/******************************************************************************
+ * Saves the edited schedule from the UI to disk, logs the update, refreshes
+ * the main-page schedule display, and reloads sorted values back into the UI.
+ ******************************************************************************/
 static void on_sched_save(GtkWidget *w, gpointer user_data) {
     App *app = (App *)user_data;
 
@@ -829,6 +966,7 @@ static void show_schedules(App *app) {
     show_page(app, "schedules");
 }
 
+/* Loads the current system date/time into the time-setting spin buttons. */
 static void populate_spins_with_current_time(App *app) {
     time_t now = time(NULL);
     struct tm *lt = localtime(&now);
@@ -841,6 +979,10 @@ static void populate_spins_with_current_time(App *app) {
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(app->spin_sec),   lt->tm_sec);
 }
 
+/******************************************************************************
+ * Applies the date/time currently shown in the spin buttons to the system
+ * clock by calling the date command through pkexec.
+ ******************************************************************************/
 static void on_apply_time_date(GtkWidget *widget, gpointer user_data) {
     App *app = (App *)user_data;
     int year, month, day, hour, min, sec;
@@ -879,12 +1021,19 @@ static void show_time_date(App *app) {
     show_page(app, "time_date");
 }
 
+/* Returns TRUE if the requested shell command is available in PATH. */
 static gboolean command_exists(const char *cmd) {
     char buf[256];
     snprintf(buf, sizeof(buf), "command -v %s >/dev/null 2>&1", cmd);
     return system(buf) == 0;
 }
 
+/******************************************************************************
+ * Runs a command using g_spawn_sync and captures stdout/stderr text.
+ *
+ * Returns 0 on success, a non-zero process status on command failure, or -1
+ * if the process could not be started.
+ ******************************************************************************/
 static int run_argv_capture(char **argv, char **out_text, char **err_text) {
     GError *error = NULL;
     gint status = -1;
@@ -918,6 +1067,7 @@ static int run_argv_capture(char **argv, char **out_text, char **err_text) {
     return status;
 }
 
+/* Formats nmcli output/error text into a user-facing Wi-Fi status message. */
 static void set_wifi_status_from_nmcli(App *app, const char *prefix, const char *out_text, const char *err_text) {
     char msg[1024];
     const char *detail = NULL;
@@ -938,6 +1088,7 @@ static void set_wifi_status_from_nmcli(App *app, const char *prefix, const char 
     ui_set_status(app->wifi_status_label, msg);
 }
 
+/* Updates the label showing the currently connected Wi-Fi network. */
 static void wifi_update_current(App *app) {
     FILE *fp = popen("sudo -n nmcli -t -f ACTIVE,SSID dev wifi 2>/dev/null | grep '^yes:' | head -n 1", "r");
     if (!fp) {
@@ -963,6 +1114,10 @@ static void wifi_update_current(App *app) {
     pclose(fp);
 }
 
+/******************************************************************************
+ * Scans for nearby Wi-Fi networks using nmcli and repopulates the network list
+ * shown on the Wi-Fi page.
+ ******************************************************************************/
 static void wifi_scan_and_fill(App *app) {
     FILE *fp;
     char line[1024];
@@ -1049,6 +1204,12 @@ static void on_wifi_rescan(GtkWidget *widget, gpointer user_data) {
     wifi_scan_and_fill((App *)user_data);
 }
 
+/******************************************************************************
+ * Attempts to connect to the currently selected Wi-Fi network using nmcli.
+ *
+ * If a password is present, it connects using password authentication.
+ * If the password field is empty, it attempts an open-network connection.
+ ******************************************************************************/
 static void on_wifi_connect(GtkWidget *widget, gpointer user_data) {
     App *app = (App *)user_data;
     const char *pw;
@@ -1077,6 +1238,7 @@ static void on_wifi_connect(GtkWidget *widget, gpointer user_data) {
     ui_set_status(app->wifi_status_label, "Connecting...");
     while (gtk_events_pending()) gtk_main_iteration();
 
+    /* Connect to a secured network using the entered password. */
     if (pw[0]) {
         char *argv_connect[] = {
             "sudo",
@@ -1114,6 +1276,7 @@ static void on_wifi_connect(GtkWidget *widget, gpointer user_data) {
     wifi_update_current(app);
 }
 
+/* Resets Wi-Fi page state, shows the page, and triggers a fresh scan. */
 static void show_wifi(App *app) {
     clear_entry_hash_arm(app);
     entry_commit_pending(app);
@@ -1126,6 +1289,7 @@ static void show_wifi(App *app) {
     wifi_scan_and_fill(app);
 }
 
+/* Updates the UI label that shows whether an admin code is currently set. */
 static void refresh_admin_code_current_label(App *app) {
     if (!app->admin_code_current_label) return;
 
@@ -1136,6 +1300,10 @@ static void refresh_admin_code_current_label(App *app) {
     }
 }
 
+/******************************************************************************
+ * Resets the admin code manager page back to its starting state based on
+ * whether an admin code already exists.
+ ******************************************************************************/
 static void reset_admin_code_manager_ui(App *app) {
     clear_entry_hash_arm(app);
     entry_commit_pending(app);
@@ -1165,6 +1333,18 @@ static void reset_admin_code_manager_ui(App *app) {
     gtk_button_set_label(GTK_BUTTON(app->admin_code_action_button), "Continue");
 }
 
+/******************************************************************************
+ * Handles the multi-step admin code workflow.
+ *
+ * No existing code:
+ *   1) enter new code
+ *   2) confirm new code
+ *
+ * Existing code:
+ *   1) verify current code
+ *   2) enter new code
+ *   3) confirm new code
+ ******************************************************************************/
 static void on_admin_code_action(GtkWidget *widget, gpointer user_data) {
     App *app = (App *)user_data;
     const char *txt;
@@ -1268,11 +1448,27 @@ static void on_admin_code_action(GtkWidget *widget, gpointer user_data) {
     }
 }
 
+/******************************************************************************
+ * Handles the multi-step admin code workflow.
+ *
+ * No existing code:
+ *   1) enter new code
+ *   2) confirm new code
+ *
+ * Existing code:
+ *   1) verify current code
+ *   2) enter new code
+ *   3) confirm new code
+ ******************************************************************************/
 static void show_admin_code_manager(App *app) {
     reset_admin_code_manager_ui(app);
     show_page(app, "admin_code_manager");
 }
 
+/******************************************************************************
+ * Opens the admin verification page for a protected action such as admin
+ * extract or admin reset.
+ ******************************************************************************/
 static void show_admin_gate(App *app, int target) {
     clear_entry_hash_arm(app);
     entry_commit_pending(app);
@@ -1309,6 +1505,10 @@ static void show_admin_gate(App *app, int target) {
     show_page(app, "admin_gate");
 }
 
+/******************************************************************************
+ * Verifies the entered admin code and routes the user to the protected action
+ * they requested, or performs the confirmed reset workflow.
+ ******************************************************************************/
 static void on_admin_gate_continue(GtkWidget *widget, gpointer user_data) {
     App *app = (App *)user_data;
     const char *entered;
@@ -1377,18 +1577,23 @@ static void on_admin_gate_continue(GtkWidget *widget, gpointer user_data) {
     show_settings(app);
 }
 
+/* Starts the protected admin extract flow. */
 static void on_request_admin_extract(GtkWidget *w, gpointer user_data) {
     App *app = (App *)user_data;
     (void)w;
     show_admin_gate(app, ADMIN_GATE_EXTRACT);
 }
 
+/* Starts the protected admin reset flow. */
 static void on_request_admin_reset(GtkWidget *w, gpointer user_data) {
     App *app = (App *)user_data;
     (void)w;
     show_admin_gate(app, ADMIN_GATE_RESET);
 }
 
+/******************************************************************************
+ * Verifies the entered admin code and, if valid, shuts down the Raspberry Pi.
+ ******************************************************************************/
 static void on_power_shutdown(GtkWidget *widget, gpointer user_data) {
     App *app = (App *)user_data;
     const char *entered;
@@ -1426,6 +1631,7 @@ static void on_power_shutdown(GtkWidget *widget, gpointer user_data) {
     }
 }
 
+/* Opens the shutdown page and resets the admin-code entry field. */
 static void show_power_admin(App *app) {
     clear_entry_hash_arm(app);
     entry_commit_pending(app);
@@ -1440,12 +1646,17 @@ static void show_power_admin(App *app) {
     show_page(app, "power_admin");
 }
 
+/* Clears the USB device list and resets the selected destination state. */
 static void usb_clear_store(App *app) {
     gtk_list_store_clear(app->usb_store);
     app->usb_selected_mount[0] = 0;
     gtk_label_set_text(GTK_LABEL(app->usb_selected_label), "Selected: (none)");
 }
 
+/******************************************************************************
+ * Scans mounted block devices and lists removable/USB destinations that can
+ * be used for admin log export.
+ ******************************************************************************/
 static void usb_scan_mounted(App *app) {
     FILE *fp;
     char line[1024];
@@ -1525,6 +1736,10 @@ static void on_admin_extract_rescan(GtkWidget *w, gpointer user_data) {
     usb_scan_mounted((App *)user_data);
 }
 
+/******************************************************************************
+ * Copies the admin log file to the selected mounted USB/removable drive using
+ * a timestamped export filename.
+ ******************************************************************************/
 static void on_admin_extract_export(GtkWidget *w, gpointer user_data) {
     App *app = (App *)user_data;
     FILE *src_touch;
@@ -1547,6 +1762,7 @@ static void on_admin_extract_export(GtkWidget *w, gpointer user_data) {
     if (src_touch) fclose(src_touch);
 
     now_stamp(stamp, sizeof(stamp));
+    /* Create a unique timestamped export filename on the selected drive. */
     snprintf(outpath, sizeof(outpath), "%s/pill_admin_export_%s.txt",
              app->usb_selected_mount, stamp);
 
@@ -1587,12 +1803,14 @@ static void on_admin_extract_export(GtkWidget *w, gpointer user_data) {
     }
 }
 
+/* Opens the admin extract page and refreshes the list of export destinations. */
 static void show_admin_extract(App *app) {
     ui_set_status(app->admin_status_label, "");
     usb_scan_mounted(app);
     show_page(app, "admin_extract");
 }
 
+/* Reads a GPIO pin value using raspi-gpio and returns 0/1, or -1 on error. */
 static int gpio_read(int pin) {
     char cmd[64];
     char buf[128];
@@ -1612,6 +1830,9 @@ static int gpio_read(int pin) {
     return (strstr(buf, "level=0") != NULL) ? 0 : 1;
 }
 
+/******************************************************************************
+ * Configures motor pins as outputs and keypad pins for matrix scanning.
+ ******************************************************************************/
 static void gpio_setup_outputs(void) {
     char cmd[128];
     int i;
@@ -1632,34 +1853,49 @@ static void gpio_setup_outputs(void) {
     }
 }
 
+/* Drives a GPIO output pin high or low using raspi-gpio. */
 static void gpio_write(int pin, int value) {
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "raspi-gpio set %d %s", pin, value ? "dh" : "dl");
     system(cmd);
 }
 
+/******************************************************************************
+ * Dispenses pills from the requested slot by driving that slot's motor forward
+ * briefly, stopping, then reversing to return the mechanism to its resting
+ * position.
+ *
+ * slot = 1 -> first dispenser motor pair
+ * slot = 2 -> second dispenser motor pair
+ ******************************************************************************/
 static void dispense(int slot) {
+    /* Slot 1: drive forward long enough to dispense. */
     if (slot == 1) {
         gpio_write(motor_pins[1], 0);//forward
         gpio_write(motor_pins[0], 1);
         usleep(1000000);
-
+        
+    /* Stop briefly before reversing. */
         gpio_write(motor_pins[0], 0);
 
+    /* Reverse to return the mechanism to its resting position. */
         gpio_write(motor_pins[1], 1);//reverse
         gpio_write(motor_pins[0], 0);
         usleep(1000000);
 
         gpio_write(motor_pins[1], 0);//off
 
+    /* Slot 2: drive forward long enough to dispense. */
     } else if (slot == 2) {
 
         gpio_write(motor_pins[3], 0);//forward
         gpio_write(motor_pins[2], 1);
         usleep(1000000);
 
+    /* Stop briefly before reversing. */
         gpio_write(motor_pins[2], 0);
-
+        
+    /* Reverse to return the mechanism to its resting position. */
         gpio_write(motor_pins[3], 1);//reverse
         gpio_write(motor_pins[2], 0);
         usleep(1000000);
@@ -1674,6 +1910,11 @@ static GtkWidget *get_current_focus_widget(App *app) {
     return app->focused_widget[app->focus_index];
 }
 
+/******************************************************************************
+ * Returns the multi-tap character set associated with a numeric keypad key.
+ *
+ * Used to simulate text entry on the matrix keypad.
+ ******************************************************************************/
 static const char *key_chars_for_digit(char key) {
     switch (key) {
         case '1': return ".@-_1";
@@ -1690,6 +1931,7 @@ static const char *key_chars_for_digit(char key) {
     }
 }
 
+/* Finalizes the currently pending multi-tap character selection. */
 static void entry_commit_pending(App *app) {
     if (app->pending_commit_timer) {
         g_source_remove(app->pending_commit_timer);
@@ -1716,6 +1958,7 @@ static gboolean entry_hash_timeout_cb(gpointer user_data) {
     return FALSE;
 }
 
+/* Clears the temporary "press # again to submit" state for entry fields. */
 static void clear_entry_hash_arm(App *app) {
     if (app->hash_arm_timer) {
         g_source_remove(app->hash_arm_timer);
@@ -1724,6 +1967,7 @@ static void clear_entry_hash_arm(App *app) {
     app->hash_armed_entry = NULL;
 }
 
+/* Deletes the current selection or the character immediately before the cursor. */
 static void entry_backspace(App *app, GtkWidget *entry) {
     GtkEditable *ed;
     gint pos, start, end;
@@ -1747,6 +1991,7 @@ static void entry_backspace(App *app, GtkWidget *entry) {
     }
 }
 
+/* Replaces the most recently entered character during multi-tap cycling. */
 static void entry_replace_last_char(App *app, GtkWidget *entry, char ch) {
     GtkEditable *ed;
     gint pos;
@@ -1770,6 +2015,7 @@ static void entry_replace_last_char(App *app, GtkWidget *entry, char ch) {
     gtk_editable_set_position(ed, pos);
 }
 
+/* Appends one character to the currently focused text entry widget. */
 static void entry_append_char(App *app, GtkWidget *entry, char ch) {
     GtkEditable *ed;
     gint pos;
@@ -1788,6 +2034,13 @@ static void entry_append_char(App *app, GtkWidget *entry, char ch) {
     gtk_editable_set_position(ed, pos);
 }
 
+/******************************************************************************
+ * Handles keypad-based text entry for GTK entry widgets.
+ *
+ * Digits cycle through multi-tap character sets.
+ * '*' performs backspace.
+ * Character selection is committed automatically after a short timeout.
+ ******************************************************************************/
 static void entry_handle_key(App *app, GtkWidget *entry, char key) {
     const char *chars;
     size_t len;
@@ -1828,6 +2081,7 @@ static void entry_handle_key(App *app, GtkWidget *entry, char key) {
     }
 }
 
+/* Submits the currently focused entry field based on which page is active. */
 static void entry_submit_current(App *app, GtkWidget *entry) {
     if (entry == app->wifi_pass_entry) {
         on_wifi_connect(NULL, app);
@@ -1847,6 +2101,10 @@ static void entry_submit_current(App *app, GtkWidget *entry) {
     }
 }
 
+/******************************************************************************
+ * Scans the matrix keypad by pulling one column low at a time and checking
+ * which row is active. Returns the mapped character for the pressed key.
+ ******************************************************************************/
 static char keypad_read(void) {
     int col, row;
 
@@ -1870,6 +2128,7 @@ static char keypad_read(void) {
     return 0;
 }
 
+/* Moves the current GTK tree selection up or down by one row. */
 static void tree_move_selection(GtkWidget *tree, int dir) {
     GtkTreeView *tv;
     GtkTreeSelection *sel;
@@ -1915,6 +2174,7 @@ static void tree_move_selection(GtkWidget *tree, int dir) {
     gtk_tree_path_free(path);
 }
 
+/* Moves focus to the previous focusable widget in the page's focus list. */
 static void ui_right(App *app) {
     if (!app || app->focus_count == 0) return;
     app->focus_index--;
@@ -1922,6 +2182,7 @@ static void ui_right(App *app) {
     gtk_widget_grab_focus(app->focused_widget[app->focus_index]);
 }
 
+/* Moves focus to the next focusable widget in the page's focus list. */
 static void ui_left(App *app) {
     if (!app || app->focus_count == 0) return;
     app->focus_index++;
@@ -1929,6 +2190,14 @@ static void ui_left(App *app) {
     gtk_widget_grab_focus(app->focused_widget[app->focus_index]);
 }
 
+/******************************************************************************
+ * Handles keypad "up" behavior.
+ *
+ * Depending on the focused widget, this may:
+ *   - move between buttons/widgets
+ *   - increment a spin button
+ *   - move up in a tree view
+ ******************************************************************************/
 static void ui_up(App *app) {
     GtkWidget *w = get_current_focus_widget(app);
     if (!w) return;
@@ -1951,6 +2220,14 @@ static void ui_up(App *app) {
     ui_left(app);
 }
 
+/******************************************************************************
+ * Handles keypad "down" behavior.
+ *
+ * Depending on the focused widget, this may:
+ *   - move between buttons/widgets
+ *   - decrement a spin button
+ *   - move down in a tree view
+ ******************************************************************************/
 static void ui_down(App *app) {
     GtkWidget *w = get_current_focus_widget(app);
     if (!w) return;
@@ -1973,6 +2250,7 @@ static void ui_down(App *app) {
     ui_right(app);
 }
 
+/* Activates the currently focused widget or button. */
 static void ui_select(App *app) {
     GtkWidget *w = get_current_focus_widget(app);
     if (!w) return;
@@ -1990,6 +2268,12 @@ static void ui_select(App *app) {
     gtk_widget_activate(w);
 }
 
+/******************************************************************************
+ * Handles keypad back-navigation.
+ *
+ * Closes active modal dialogs when present, otherwise returns to the
+ * appropriate parent page.
+ ******************************************************************************/
 static void ui_back(App *app) {
     const char *page;
 
@@ -2016,6 +2300,20 @@ static void ui_back(App *app) {
     }
 }
 
+/******************************************************************************
+ * Polls the physical keypad and maps key presses to either:
+ *   - navigation actions
+ *   - widget activation
+ *   - entry-field text input
+ *
+ * Navigation mapping:
+ *   2 = up
+ *   8 = down
+ *   4 = left
+ *   6 = right
+ *   # = select / submit
+ *   * = back / delete
+ ******************************************************************************/
 static gboolean poll_keypad(gpointer user_data) {
     App *app = (App *)user_data;
     static char last_key = 0;
@@ -2074,6 +2372,7 @@ static gboolean poll_keypad(gpointer user_data) {
     return TRUE;
 }
 
+/* Recursively collects visible, sensitive, focusable widgets from a container tree. */
 static void scan_focusable(App *app, GtkWidget *w) {
     if (!w) return;
     if (!gtk_widget_get_visible(w)) return;
@@ -2099,6 +2398,7 @@ static void scan_focusable(App *app, GtkWidget *w) {
     }
 }
 
+/* Rebuilds the current focusable-widget list for the active page or dialog. */
 static void populate_focus_widgets(App *app, GtkWidget *root) {
     app->focus_count = 0;
     app->focus_index = 0;
@@ -2110,12 +2410,14 @@ static void populate_focus_widgets(App *app, GtkWidget *root) {
     }
 }
 
+/* Refreshes keypad focus targets for the currently visible page or modal. */
 static void refresh_focus_for_current_page(App *app) {
     GtkWidget *root = get_focus_root(app);
     if (!root) return;
     populate_focus_widgets(app, root);
 }
 
+/* Loads custom GTK CSS used to highlight the currently focused widget. */
 static void load_css(void) {
     GtkCssProvider *provider = gtk_css_provider_new();
 
@@ -2135,7 +2437,11 @@ static void load_css(void) {
     g_object_unref(provider);
 }
 
-//for test case
+/******************************************************************************
+ * Timed dispense test helpers
+ *
+ * Used to repeatedly trigger dispense operations for validation/testing.
+ ******************************************************************************/
 static gboolean test_dispense_callback(gpointer user_data) {
     App *app = (App *)user_data;
     char msg[100];
@@ -2158,7 +2464,7 @@ static gboolean test_dispense_callback(gpointer user_data) {
     return TRUE;
 }
 
-//handlers for the buttons for the test.
+/* Starts the timed dispense test sequence. */
 static void on_test_start(GtkWidget *w, gpointer user_data) {
     App *app = (App *)user_data;
 
@@ -2177,6 +2483,7 @@ static void on_test_start(GtkWidget *w, gpointer user_data) {
     app->test_timer_id = g_timeout_add_seconds(30, test_dispense_callback, app);
 }
 
+/* Stops the timed dispense test sequence if it is running. */
 static void on_test_stop(GtkWidget *w, gpointer user_data) {
     App *app = (App *)user_data;
 
@@ -2197,7 +2504,7 @@ static void on_test_stop(GtkWidget *w, gpointer user_data) {
     ui_set_status(app->test_status_label, "Test stopped.");
 }
 
-
+/* Checks whether the saved schedule file has changed on disk since last read. */
 static gboolean schedule_file_changed(time_t *last_mtime_out) {
     char path[512];
     struct stat st;
@@ -2217,6 +2524,16 @@ static gboolean schedule_file_changed(time_t *last_mtime_out) {
     return FALSE;
 }
 
+/******************************************************************************
+ * Periodic runtime update callback.
+ *
+ * This function:
+ *   - updates visible time labels
+ *   - reloads schedules if the schedule file changed on disk
+ *   - refreshes the current-day schedule display when needed
+ *   - prevents duplicate dispense actions within the same minute
+ *   - triggers dispense events when the current time matches an enabled entry
+ ******************************************************************************/
 static gboolean tick_update_time(gpointer user_data) {
     App *app = (App *)user_data;
     static time_t last_mtime = 0;
@@ -2271,6 +2588,7 @@ static gboolean tick_update_time(gpointer user_data) {
     return TRUE;
 }
 
+/* Builds the main/home page showing current time and today's schedule. */
 static GtkWidget *build_main_page(App *app) {
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
@@ -2317,6 +2635,7 @@ static GtkWidget *build_main_page(App *app) {
     return root;
 }
 
+/* Builds the settings page containing navigation buttons for system features. */
 static GtkWidget *build_settings_page(App *app) {
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
     GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
@@ -2420,6 +2739,7 @@ static GtkWidget *build_settings_page(App *app) {
     return root;
 }
 
+/* Builds the editor UI for one day's schedule entries for one pill slot. */
 static GtkWidget *build_slot_editor(App *app, int day, int slot) {
     GtkWidget *frame = gtk_frame_new(slot == 0 ? "Pill Slot 1" : "Pill Slot 2");
     GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
@@ -2479,6 +2799,7 @@ static GtkWidget *build_slot_editor(App *app, int day, int slot) {
     return frame;
 }
 
+/* Builds the full weekly schedule editor page. */
 static GtkWidget *build_schedules_page(App *app) {
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
     GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
@@ -2535,6 +2856,7 @@ static GtkWidget *build_schedules_page(App *app) {
     return root;
 }
 
+/* Builds the time/date configuration page. */
 static GtkWidget *build_time_date_page(App *app) {
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
     GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
@@ -2592,6 +2914,7 @@ static GtkWidget *build_time_date_page(App *app) {
     return root;
 }
 
+/* Builds the Wi-Fi configuration page with scan, select, and connect controls. */
 static GtkWidget *build_wifi_page(App *app) {
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
     GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
@@ -2678,6 +3001,7 @@ static GtkWidget *build_wifi_page(App *app) {
     return root;
 }
 
+/* Builds the admin-protected shutdown page. */
 static GtkWidget *build_power_page(App *app) {
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
     GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
@@ -2722,6 +3046,7 @@ static GtkWidget *build_power_page(App *app) {
     return root;
 }
 
+/* Builds the page used to create or update the admin code. */
 static GtkWidget *build_admin_code_manager_page(App *app) {
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
     GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
@@ -2776,6 +3101,7 @@ static GtkWidget *build_admin_code_manager_page(App *app) {
     return root;
 }
 
+/* Builds the verification page used before protected admin actions. */
 static GtkWidget *build_admin_gate_page(App *app) {
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
     GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
@@ -2825,6 +3151,7 @@ static GtkWidget *build_admin_gate_page(App *app) {
     return root;
 }
 
+/* Builds the page used for the log extract function. */
 static GtkWidget *build_admin_extract_page(App *app) {
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
     GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
